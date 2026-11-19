@@ -26,9 +26,12 @@ Design: docs/plans/2026-11-19-corpus-explorer-design.md
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sqlite3
+from contextlib import closing
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -61,6 +64,63 @@ LABEL_WORDS = 8
 
 # A markdown heading ("# With Ghaṭīkāra") or breadcrumb ("* Middle Discourses 81").
 MARKUP_LINE = re.compile(r"^\s*(#+|\*)\s")
+
+# Datasette shows the keys as links between tables, and finds chunks_fts through
+# its content=[chunks] option (the sqlite-utils convention) to offer search.
+SCHEMA = """
+CREATE TABLE suttas (
+    sutta_uid TEXT PRIMARY KEY,
+    doc_title TEXT,
+    nikaya TEXT,
+    n_chunks INTEGER
+);
+CREATE TABLE chunks (
+    uuid TEXT PRIMARY KEY,
+    sutta_uid TEXT REFERENCES suttas(sutta_uid),
+    nikaya TEXT,
+    chunk_index INTEGER,
+    word_count INTEGER,
+    chunk_text TEXT,
+    x REAL,
+    y REAL,
+    hub_count INTEGER,
+    neighbour_mix REAL,
+    family_id INTEGER,
+    family_size INTEGER,
+    gold_mode TEXT,
+    gold_is_verse INTEGER,
+    gold_has_simile INTEGER,
+    pred_mode TEXT,
+    pred_confidence REAL
+);
+CREATE TABLE neighbours (
+    uuid TEXT REFERENCES chunks(uuid),
+    rank INTEGER,
+    neighbour_uuid TEXT REFERENCES chunks(uuid),
+    cosine REAL,
+    PRIMARY KEY (uuid, rank)
+);
+CREATE INDEX chunks_by_sutta ON chunks(sutta_uid);
+CREATE INDEX chunks_by_family ON chunks(family_id);
+CREATE INDEX neighbours_by_neighbour ON neighbours(neighbour_uuid);
+CREATE VIRTUAL TABLE chunks_fts USING fts5(chunk_text, content=[chunks]);
+"""
+CHUNK_COLUMNS = [
+    "uuid",
+    "sutta_uid",
+    "nikaya",
+    "chunk_index",
+    "word_count",
+    "chunk_text",
+    "x",
+    "y",
+    "hub_count",
+    "neighbour_mix",
+    "family_id",
+    "family_size",
+    *GOLD_COLUMNS,
+    *PRED_COLUMNS,
+]
 
 
 def neighbours(vectors: np.ndarray, k: int = K) -> tuple[np.ndarray, np.ndarray]:
@@ -257,3 +317,58 @@ def build(
             logger.warning("%d of %d gold labels matched no chunk.", unmatched, len(gold))
 
     return table, family_labels(table, vectors), stats
+
+
+def _replace(path: Path, write: Callable[[Path], object]) -> None:
+    """Write beside the target, then swap it in, so no reader sees half a file."""
+    partial = path.with_name(path.name + ".partial")
+    partial.unlink(missing_ok=True)
+    write(partial)
+    os.replace(partial, path)
+
+
+def write_parquet(table: pd.DataFrame, labels: pd.DataFrame, out_dir: Path) -> None:
+    """Embedding Atlas's inputs: one row per chunk in cache order, and the family labels.
+
+    Row order is part of the format: Embedding Atlas reads neighbour ids as
+    zero-based row indices.
+    """
+    _replace(out_dir / "explore.parquet", lambda path: table.to_parquet(path, index=False))
+    _replace(out_dir / "explore_labels.parquet", lambda path: labels.to_parquet(path, index=False))
+
+
+def write_sqlite(table: pd.DataFrame, path: Path) -> None:
+    """Datasette's input: suttas, chunks and neighbours, linked by keys and searchable.
+
+    Chunks go in reading order, sutta by sutta. Neighbour links name chunks by
+    uuid, so this order is free to differ from the parquet's.
+    """
+    suttas = (
+        table.groupby("sutta_uid", sort=True)
+        .agg(doc_title=("doc_title", "first"), nikaya=("nikaya", "first"), n_chunks=("uuid", "size"))
+        .reset_index()
+    )
+    chunks = table.sort_values(["sutta_uid", "chunk_index"])[CHUNK_COLUMNS]
+
+    uuids = table["uuid"].to_numpy()
+    ids = np.array([list(row["ids"]) for row in table["neighbors"]])
+    distances = np.array([list(row["distances"]) for row in table["neighbors"]], dtype=float)
+    links = pd.DataFrame(
+        {
+            "uuid": np.repeat(uuids, ids.shape[1]),
+            "rank": np.tile(np.arange(1, ids.shape[1] + 1), len(ids)),
+            "neighbour_uuid": uuids[ids.ravel()],
+            "cosine": 1.0 - distances.ravel(),
+        }
+    )
+
+    def write(partial: Path) -> None:
+        with closing(sqlite3.connect(partial)) as db:
+            db.executescript(SCHEMA)
+            suttas.to_sql("suttas", db, if_exists="append", index=False)
+            chunks.to_sql("chunks", db, if_exists="append", index=False)
+            links.to_sql("neighbours", db, if_exists="append", index=False)
+            db.execute("INSERT INTO chunks_fts(rowid, chunk_text) SELECT rowid, chunk_text FROM chunks")
+            db.commit()
+
+    _replace(path, write)

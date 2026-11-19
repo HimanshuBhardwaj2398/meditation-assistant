@@ -1,5 +1,7 @@
 """Explorer snapshot tests: synthetic vectors, no network, no UMAP."""
 
+import sqlite3
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -211,3 +213,52 @@ def test_build_attaches_gold_and_predictions(flat_projection, monkeypatch):
     assert table.loc[1, "gold_mode"] == "practice"
     assert (table["pred_mode"] == "doctrine").all()
     assert stats["genre"] == {"gold_labels": 2, "matched": 1, "unmatched": 1, "probe_oof_macro_f1": 0.8}
+
+
+@pytest.fixture
+def snapshot(flat_projection, monkeypatch):
+    _stub_probe(monkeypatch)
+    vectors, df = _corpus()
+    gold = pd.DataFrame(
+        [{"sutta_uid": "sn0", "chunk_index": 1, "mode": "practice", "is_verse": True, "has_simile": False}]
+    )
+    return explore.build(vectors, df, gold)
+
+
+def test_write_parquet_keeps_embedding_atlas_neighbour_shape(snapshot, tmp_path):
+    table, labels, _ = snapshot
+
+    explore.write_parquet(table, labels, tmp_path)
+
+    back = pd.read_parquet(tmp_path / "explore.parquet")
+    first = back.loc[0, "neighbors"]
+    assert first["ids"].tolist() == table.loc[0, "neighbors"]["ids"]
+    assert 0 <= first["ids"].min() and first["ids"].max() < len(back)
+    np.testing.assert_allclose(first["distances"], table.loc[0, "neighbors"]["distances"])
+    assert pd.read_parquet(tmp_path / "explore_labels.parquet").columns.tolist() == ["x", "y", "text", "priority"]
+    assert not list(tmp_path.glob("*.partial"))
+
+
+def test_write_sqlite_links_tables_and_indexes_text(snapshot, tmp_path):
+    table, _, _ = snapshot
+
+    explore.write_sqlite(table, tmp_path / "explore.db")
+
+    db = sqlite3.connect(tmp_path / "explore.db")
+    try:
+        counts = {
+            name: db.execute(f"select count(*) from {name}").fetchone()[0]
+            for name in ("suttas", "chunks", "neighbours")
+        }
+        assert counts == {"suttas": 4, "chunks": 12, "neighbours": 12 * explore.K}
+        assert {row[2] for row in db.execute("pragma foreign_key_list(neighbours)")} == {"chunks"}
+        hits = db.execute(
+            "select uuid from chunks where rowid in"
+            " (select rowid from chunks_fts where chunks_fts match 'restlessness')"
+        ).fetchall()
+        assert hits == [("u04",)]
+        row = "select gold_mode, gold_is_verse, family_id from chunks where uuid = ?"
+        assert db.execute(row, ("u01",)).fetchone() == ("practice", 1, 1)
+        assert db.execute(row, ("u00",)).fetchone() == (None, None, None)
+    finally:
+        db.close()
