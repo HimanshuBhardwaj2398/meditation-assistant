@@ -58,3 +58,40 @@ def test_families_are_numbered_largest_first_and_singletons_get_zero():
 
     assert family_id.tolist() == [1, 2, 1, 0, 2, 1, 0]
     assert size.tolist() == [3, 2, 3, 1, 2, 3, 1]
+
+
+def _with_families(df, **columns):
+    """The test corpus with family 1 (rows 1, 5, 9) and family 2 (rows 3, 7) assigned."""
+    return df.assign(
+        family_id=pd.array(
+            [pd.NA, 1, pd.NA, 2, pd.NA, 1, pd.NA, 2, pd.NA, 1, pd.NA, pd.NA], dtype="Int64"
+        ),
+        family_size=[1, 3, 1, 2, 1, 3, 1, 2, 1, 3, 1, 1],
+        **columns,
+    )
+
+
+def test_opening_skips_markdown_headings_and_breadcrumbs():
+    text = "* Middle Discourses 81\n\n# With Ghaṭīkāra  \nSo I have heard. At one time the Buddha"
+
+    assert explore.opening(text, words=5) == "So I have heard. At…"
+
+
+def test_family_labels_sit_at_member_medians_and_rank_by_size():
+    vectors, df = _corpus()
+    table = _with_families(df, x=np.arange(12, dtype=float), y=np.arange(12, dtype=float) * 2)
+
+    labels = explore.family_labels(table, vectors, min_size=2)
+
+    assert labels.columns.tolist() == ["x", "y", "text", "priority"]
+    assert labels["priority"].tolist() == [3.0, 2.0]
+    assert labels.loc[0, ["x", "y"]].tolist() == [5.0, 10.0]
+    assert labels.loc[0, "text"].startswith("3× Passage number")
+
+
+def test_family_labels_skip_small_families_and_cap_the_count():
+    vectors, df = _corpus()
+    table = _with_families(df, x=0.0, y=0.0)
+
+    assert len(explore.family_labels(table, vectors, min_size=3)) == 1
+    assert len(explore.family_labels(table, vectors, min_size=2, top=1)) == 1
