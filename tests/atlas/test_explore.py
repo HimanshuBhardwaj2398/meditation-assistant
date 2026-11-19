@@ -1,5 +1,6 @@
 """Explorer snapshot tests: synthetic vectors, no network, no UMAP."""
 
+import json
 import sqlite3
 
 import numpy as np
@@ -22,7 +23,9 @@ def _corpus(seed=0):
     rng = np.random.default_rng(seed)
     vectors = rng.standard_normal((12, 16)).astype(np.float32)
     vectors[[1, 5, 9]] = vectors[1] + 0.001 * rng.standard_normal((3, 16))
-    texts = [f"* Linked Discourses\n\n# Title {i}\nPassage number {i} about calm" for i in range(12)]
+    texts = [
+        f"* Linked Discourses\n\n# Title {i}\nPassage number {i} about calm" for i in range(12)
+    ]
     texts[4] += " and restlessness"
     df = pd.DataFrame(
         {
@@ -122,9 +125,27 @@ def test_attach_gold_aligns_on_sutta_and_index_and_counts_orphans():
     _, df = _corpus()
     gold = pd.DataFrame(
         [
-            {"sutta_uid": "sn0", "chunk_index": 1, "mode": "practice", "is_verse": False, "has_simile": True},
-            {"sutta_uid": "sn2", "chunk_index": 0, "mode": "doctrine", "is_verse": True, "has_simile": False},
-            {"sutta_uid": "sn9", "chunk_index": 0, "mode": "narrative", "is_verse": False, "has_simile": False},
+            {
+                "sutta_uid": "sn0",
+                "chunk_index": 1,
+                "mode": "practice",
+                "is_verse": False,
+                "has_simile": True,
+            },
+            {
+                "sutta_uid": "sn2",
+                "chunk_index": 0,
+                "mode": "doctrine",
+                "is_verse": True,
+                "has_simile": False,
+            },
+            {
+                "sutta_uid": "sn9",
+                "chunk_index": 0,
+                "mode": "narrative",
+                "is_verse": False,
+                "has_simile": False,
+            },
         ]
     )
 
@@ -154,9 +175,15 @@ def test_gold_rows_get_out_of_fold_predictions():
     rng = np.random.default_rng(1)
     n, dims = 40, 64
     vectors = _unit(rng.standard_normal((n, dims)))
-    df = pd.DataFrame({"sutta_uid": [f"s{i // 4}" for i in range(n)], "chunk_index": [i % 4 for i in range(n)]})
-    gold = pd.Series(np.array(["doctrine", "narrative", "practice"])[rng.permutation(np.arange(n) % 3)])
-    probe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced"))
+    df = pd.DataFrame(
+        {"sutta_uid": [f"s{i // 4}" for i in range(n)], "chunk_index": [i % 4 for i in range(n)]}
+    )
+    gold = pd.Series(
+        np.array(["doctrine", "narrative", "practice"])[rng.permutation(np.arange(n) % 3)]
+    )
+    probe = make_pipeline(
+        StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced")
+    )
     assert (probe.fit(vectors, gold).predict(vectors) == gold).mean() > 0.95
 
     predictions, _ = explore.predict_genre(vectors, df, gold)
@@ -203,8 +230,20 @@ def test_build_attaches_gold_and_predictions(flat_projection, monkeypatch):
     vectors, df = _corpus()
     gold = pd.DataFrame(
         [
-            {"sutta_uid": "sn0", "chunk_index": 1, "mode": "practice", "is_verse": False, "has_simile": False},
-            {"sutta_uid": "zz", "chunk_index": 0, "mode": "doctrine", "is_verse": False, "has_simile": False},
+            {
+                "sutta_uid": "sn0",
+                "chunk_index": 1,
+                "mode": "practice",
+                "is_verse": False,
+                "has_simile": False,
+            },
+            {
+                "sutta_uid": "zz",
+                "chunk_index": 0,
+                "mode": "doctrine",
+                "is_verse": False,
+                "has_simile": False,
+            },
         ]
     )
 
@@ -212,7 +251,12 @@ def test_build_attaches_gold_and_predictions(flat_projection, monkeypatch):
 
     assert table.loc[1, "gold_mode"] == "practice"
     assert (table["pred_mode"] == "doctrine").all()
-    assert stats["genre"] == {"gold_labels": 2, "matched": 1, "unmatched": 1, "probe_oof_macro_f1": 0.8}
+    assert stats["genre"] == {
+        "gold_labels": 2,
+        "matched": 1,
+        "unmatched": 1,
+        "probe_oof_macro_f1": 0.8,
+    }
 
 
 @pytest.fixture
@@ -220,7 +264,15 @@ def snapshot(flat_projection, monkeypatch):
     _stub_probe(monkeypatch)
     vectors, df = _corpus()
     gold = pd.DataFrame(
-        [{"sutta_uid": "sn0", "chunk_index": 1, "mode": "practice", "is_verse": True, "has_simile": False}]
+        [
+            {
+                "sutta_uid": "sn0",
+                "chunk_index": 1,
+                "mode": "practice",
+                "is_verse": True,
+                "has_simile": False,
+            }
+        ]
     )
     return explore.build(vectors, df, gold)
 
@@ -235,7 +287,12 @@ def test_write_parquet_keeps_embedding_atlas_neighbour_shape(snapshot, tmp_path)
     assert first["ids"].tolist() == table.loc[0, "neighbors"]["ids"]
     assert 0 <= first["ids"].min() and first["ids"].max() < len(back)
     np.testing.assert_allclose(first["distances"], table.loc[0, "neighbors"]["distances"])
-    assert pd.read_parquet(tmp_path / "explore_labels.parquet").columns.tolist() == ["x", "y", "text", "priority"]
+    assert pd.read_parquet(tmp_path / "explore_labels.parquet").columns.tolist() == [
+        "x",
+        "y",
+        "text",
+        "priority",
+    ]
     assert not list(tmp_path.glob("*.partial"))
 
 
@@ -262,3 +319,41 @@ def test_write_sqlite_links_tables_and_indexes_text(snapshot, tmp_path):
         assert db.execute(row, ("u00",)).fetchone() == (None, None, None)
     finally:
         db.close()
+
+
+def test_main_refuses_a_stale_cache(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(explore, "check_drift", lambda: False)
+
+    assert explore.main(["--out-dir", str(tmp_path)]) == 1
+    assert "atlas.refresh --rebuild" in capsys.readouterr().out
+    assert not list(tmp_path.iterdir())
+
+
+def test_main_writes_the_snapshot(monkeypatch, tmp_path, flat_projection):
+    vectors, df = _corpus()
+    monkeypatch.setattr(explore, "check_drift", lambda: True)
+    monkeypatch.setattr(explore, "load", lambda: (vectors, df))
+
+    assert explore.main(["--out-dir", str(tmp_path), "--gold", str(tmp_path / "absent.jsonl")]) == 0
+
+    names = {path.name for path in tmp_path.iterdir()}
+    assert names == {"explore.parquet", "explore_labels.parquet", "explore.db", "explore.json"}
+    provenance = json.loads((tmp_path / "explore.json").read_text())
+    assert provenance["chunks"] == 12 and provenance["corpus"].startswith("12-")
+    assert provenance["genre"] is None
+
+
+def test_summary_reports_matches_and_the_probe_score():
+    stats = {
+        "chunks": 7144,
+        "corpus": "7144-abc",
+        "families": {"n_families": 512, "duplicate_mass": 0.19},
+        "genre": {"gold_labels": 482, "matched": 480, "unmatched": 2, "probe_oof_macro_f1": 0.7921},
+    }
+
+    text = explore.summary(stats)
+
+    assert "7,144 chunks" in text and "19% of chunks" in text
+    assert "480 of 482 gold labels" in text and "macro F1 0.792" in text
+    stats["genre"]["probe_oof_macro_f1"] = None
+    assert "no gold label matched" in explore.summary(stats)

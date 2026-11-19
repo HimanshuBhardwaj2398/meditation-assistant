@@ -25,13 +25,16 @@ Design: docs/plans/2026-11-19-corpus-explorer-design.md
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import os
 import re
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -42,15 +45,32 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from atlas.geometry import centre, hubness
+from atlas.loader import CACHE_DIR, check_drift, fingerprint, load
 from atlas.pericopes import families
 from atlas.structure import exemplars, project
 
 logger = logging.getLogger(__name__)
 
-META_COLUMNS = ["uuid", "sutta_uid", "nikaya", "doc_title", "chunk_index", "word_count", "chunk_text"]
+META_COLUMNS = [
+    "uuid",
+    "sutta_uid",
+    "nikaya",
+    "doc_title",
+    "chunk_index",
+    "word_count",
+    "chunk_text",
+]
 FAMILY_THRESHOLD = 0.90
 UMAP_NEIGHBOURS = 15
 SEED = 42
+
+LAUNCH = """\
+Open the map:
+    uvx embedding-atlas@0.26.0 {out}/explore.parquet --text chunk_text --x x --y y \\
+        --neighbors neighbors --labels {out}/explore_labels.parquet
+Open the tables:
+    uvx --with datasette-plot==0.1.0 datasette@1.0a43 {out}/explore.db \\
+        -m atlas/explore_metadata.yaml -c atlas/explore_datasette.yaml"""
 
 GOLD_PATH = Path("data/labels/genre_gold_v2.jsonl")
 GOLD_RENAME = {"mode": "gold_mode", "is_verse": "gold_is_verse", "has_simile": "gold_has_simile"}
@@ -223,7 +243,9 @@ def attach_gold(df: pd.DataFrame, gold: pd.DataFrame) -> tuple[pd.DataFrame, int
     labels = gold.rename(columns=GOLD_RENAME)[keys + GOLD_COLUMNS]
     aligned = df[keys].merge(labels, on=keys, how="left", validate="many_to_one")
     found = labels.merge(df[keys].drop_duplicates(), on=keys, how="left", indicator=True)
-    aligned = aligned[GOLD_COLUMNS].astype({"gold_is_verse": "boolean", "gold_has_simile": "boolean"})
+    aligned = aligned[GOLD_COLUMNS].astype(
+        {"gold_is_verse": "boolean", "gold_has_simile": "boolean"}
+    )
     return aligned.reset_index(drop=True), int((found["_merge"] == "left_only").sum())
 
 
@@ -248,18 +270,22 @@ def predict_genre(
     labelled = labelled[np.lexsort((df["chunk_index"].to_numpy()[labelled], sutta[labelled]))]
 
     unit = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
-    X, y = unit[labelled], gold_mode.to_numpy()[labelled].astype(str)
-    probe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced"))
+    features, modes = unit[labelled], gold_mode.to_numpy()[labelled].astype(str)
+    probe = make_pipeline(
+        StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced")
+    )
     folds = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
-    held_out = cross_val_predict(probe, X, y, groups=sutta[labelled], cv=folds, method="predict_proba")
+    held_out = cross_val_predict(
+        probe, features, modes, groups=sutta[labelled], cv=folds, method="predict_proba"
+    )
 
-    proba = probe.fit(X, y).predict_proba(unit)
+    proba = probe.fit(features, modes).predict_proba(unit)
     proba[labelled] = held_out
     classes = probe.classes_
     predictions = pd.DataFrame(
         {"pred_mode": classes[proba.argmax(axis=1)], "pred_confidence": proba.max(axis=1)}
     )
-    return predictions, float(f1_score(y, classes[held_out.argmax(axis=1)], average="macro"))
+    return predictions, float(f1_score(modes, classes[held_out.argmax(axis=1)], average="macro"))
 
 
 def build(
@@ -345,7 +371,9 @@ def write_sqlite(table: pd.DataFrame, path: Path) -> None:
     """
     suttas = (
         table.groupby("sutta_uid", sort=True)
-        .agg(doc_title=("doc_title", "first"), nikaya=("nikaya", "first"), n_chunks=("uuid", "size"))
+        .agg(
+            doc_title=("doc_title", "first"), nikaya=("nikaya", "first"), n_chunks=("uuid", "size")
+        )
         .reset_index()
     )
     chunks = table.sort_values(["sutta_uid", "chunk_index"])[CHUNK_COLUMNS]
@@ -368,7 +396,73 @@ def write_sqlite(table: pd.DataFrame, path: Path) -> None:
             suttas.to_sql("suttas", db, if_exists="append", index=False)
             chunks.to_sql("chunks", db, if_exists="append", index=False)
             links.to_sql("neighbours", db, if_exists="append", index=False)
-            db.execute("INSERT INTO chunks_fts(rowid, chunk_text) SELECT rowid, chunk_text FROM chunks")
+            db.execute(
+                "INSERT INTO chunks_fts(rowid, chunk_text) SELECT rowid, chunk_text FROM chunks"
+            )
             db.commit()
 
     _replace(path, write)
+
+
+def write_provenance(stats: dict, out_dir: Path) -> None:
+    """explore.json: which corpus the snapshot describes, and how it was built."""
+    _replace(
+        out_dir / "explore.json", lambda path: path.write_text(json.dumps(stats, indent=2) + "\n")
+    )
+
+
+def summary(stats: dict) -> str:
+    """What the snapshot holds, in a few lines for the terminal."""
+    found = stats["families"]
+    lines = [
+        f"Snapshot of {stats['chunks']:,} chunks (corpus {stats['corpus']}).",
+        f"Pericope families: {found['n_families']:,}, holding {found['duplicate_mass']:.0%} of chunks.",
+    ]
+    genre = stats["genre"]
+    if genre is None:
+        lines.append("Genre: no gold labels, so no predictions.")
+    elif genre["probe_oof_macro_f1"] is None:
+        lines.append("Genre: no gold label matched a chunk, so no predictions.")
+    else:
+        lines.append(
+            f"Genre: {genre['matched']} of {genre['gold_labels']} gold labels matched a chunk; "
+            f"probe out-of-fold macro F1 {genre['probe_oof_macro_f1']:.3f}."
+        )
+    return "\n".join(lines)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--out-dir", type=Path, default=CACHE_DIR, help="where to write the snapshot"
+    )
+    parser.add_argument("--gold", type=Path, default=GOLD_PATH, help="gold genre labels (JSONL)")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    if not check_drift():
+        print(
+            "The atlas cache no longer matches the database. Rebuild it first:\n"
+            "    poetry run python -m atlas.refresh --rebuild"
+        )
+        return 1
+
+    vectors, df = load()
+    table, labels, stats = build(vectors, df, load_gold(args.gold))
+    stats["corpus"] = fingerprint(table["uuid"])
+    stats["built_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    write_parquet(table, labels, args.out_dir)
+    write_sqlite(table, args.out_dir / "explore.db")
+    write_provenance(stats, args.out_dir)
+
+    print(summary(stats))
+    print(LAUNCH.format(out=args.out_dir))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
