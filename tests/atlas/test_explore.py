@@ -2,6 +2,9 @@
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from atlas import explore
 
@@ -95,3 +98,64 @@ def test_family_labels_skip_small_families_and_cap_the_count():
 
     assert len(explore.family_labels(table, vectors, min_size=3)) == 1
     assert len(explore.family_labels(table, vectors, min_size=2, top=1)) == 1
+
+
+def _genre_corpus(n_suttas=10, per_sutta=6, dims=8, seed=0):
+    """Three separable modes spread over many suttas, so every fold sees every mode."""
+    rng = np.random.default_rng(seed)
+    n = n_suttas * per_sutta
+    modes = np.array(["doctrine", "narrative", "practice"])[np.arange(n) % 3]
+    vectors = 3 * np.eye(3, dims)[np.arange(n) % 3] + 0.3 * rng.standard_normal((n, dims))
+    df = pd.DataFrame(
+        {
+            "sutta_uid": [f"s{i // per_sutta}" for i in range(n)],
+            "chunk_index": [i % per_sutta for i in range(n)],
+        }
+    )
+    return _unit(vectors), df, pd.Series(modes)
+
+
+def test_attach_gold_aligns_on_sutta_and_index_and_counts_orphans():
+    _, df = _corpus()
+    gold = pd.DataFrame(
+        [
+            {"sutta_uid": "sn0", "chunk_index": 1, "mode": "practice", "is_verse": False, "has_simile": True},
+            {"sutta_uid": "sn2", "chunk_index": 0, "mode": "doctrine", "is_verse": True, "has_simile": False},
+            {"sutta_uid": "sn9", "chunk_index": 0, "mode": "narrative", "is_verse": False, "has_simile": False},
+        ]
+    )
+
+    aligned, unmatched = explore.attach_gold(df, gold)
+
+    assert unmatched == 1
+    assert aligned["gold_mode"].iloc[1] == "practice"
+    assert aligned["gold_mode"].iloc[6] == "doctrine"
+    assert aligned["gold_mode"].notna().sum() == 2
+    assert bool(aligned["gold_is_verse"].iloc[6]) is True
+    assert pd.isna(aligned["gold_is_verse"].iloc[0])
+
+
+def test_predict_genre_recovers_separable_modes():
+    vectors, df, modes = _genre_corpus()
+    gold = modes.where(np.arange(len(modes)) % 2 == 0)
+
+    predictions, score = explore.predict_genre(vectors, df, gold)
+
+    assert score > 0.95
+    assert (predictions["pred_mode"] == modes).mean() > 0.95
+    assert predictions["pred_confidence"].between(1 / 3, 1).all()
+
+
+def test_gold_rows_get_out_of_fold_predictions():
+    """A probe fitted on random labels memorises them; held-out predictions cannot."""
+    rng = np.random.default_rng(1)
+    n, dims = 40, 64
+    vectors = _unit(rng.standard_normal((n, dims)))
+    df = pd.DataFrame({"sutta_uid": [f"s{i // 4}" for i in range(n)], "chunk_index": [i % 4 for i in range(n)]})
+    gold = pd.Series(np.array(["doctrine", "narrative", "practice"])[rng.permutation(np.arange(n) % 3)])
+    probe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced"))
+    assert (probe.fit(vectors, gold).predict(vectors) == gold).mean() > 0.95
+
+    predictions, _ = explore.predict_genre(vectors, df, gold)
+
+    assert (predictions["pred_mode"] == gold).mean() < 0.7

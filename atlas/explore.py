@@ -25,12 +25,27 @@ Design: docs/plans/2026-11-19-corpus-explorer-design.md
 
 from __future__ import annotations
 
+import logging
 import re
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from atlas.structure import exemplars
+
+logger = logging.getLogger(__name__)
+
+GOLD_PATH = Path("data/labels/genre_gold_v2.jsonl")
+GOLD_RENAME = {"mode": "gold_mode", "is_verse": "gold_is_verse", "has_simile": "gold_has_simile"}
+GOLD_COLUMNS = list(GOLD_RENAME.values())
+PRED_COLUMNS = ["pred_mode", "pred_confidence"]
 
 K = 10
 LABEL_TOP = 40
@@ -121,3 +136,60 @@ def family_labels(
             }
         )
     return pd.DataFrame(rows, columns=["x", "y", "text", "priority"])
+
+
+def load_gold(path: Path = GOLD_PATH) -> Optional[pd.DataFrame]:
+    """Gold genre labels, or None when the file is missing."""
+    if not path.exists():
+        logger.warning("No gold labels at %s, so genre prediction is skipped.", path)
+        return None
+    return pd.read_json(path, lines=True)
+
+
+def attach_gold(df: pd.DataFrame, gold: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Gold columns aligned to df's rows, and how many labels matched no chunk.
+
+    Labels are keyed by (sutta_uid, chunk_index), not by chunk uuid, so
+    re-chunking a sutta orphans its labels. Orphans are counted and reported.
+    """
+    keys = ["sutta_uid", "chunk_index"]
+    labels = gold.rename(columns=GOLD_RENAME)[keys + GOLD_COLUMNS]
+    aligned = df[keys].merge(labels, on=keys, how="left", validate="many_to_one")
+    found = labels.merge(df[keys].drop_duplicates(), on=keys, how="left", indicator=True)
+    aligned = aligned[GOLD_COLUMNS].astype({"gold_is_verse": "boolean", "gold_has_simile": "boolean"})
+    return aligned.reset_index(drop=True), int((found["_merge"] == "left_only").sum())
+
+
+def predict_genre(
+    vectors: np.ndarray, df: pd.DataFrame, gold_mode: pd.Series
+) -> tuple[pd.DataFrame, Optional[float]]:
+    """A predicted rhetorical mode for every chunk, and the probe's honest score.
+
+    The probe is the scale-up notebook's: standardised Voyage vectors into a
+    balanced logistic regression. Gold rows get out-of-fold predictions, grouped
+    by sutta, so any disagreement with gold comes from a sutta the model never
+    trained on. A fit on all the gold rows predicts every other row.
+    """
+    labelled = np.flatnonzero(gold_mode.notna().to_numpy())
+    if labelled.size == 0:
+        logger.warning("No gold label matched a chunk, so genre prediction is skipped.")
+        empty = pd.DataFrame({"pred_mode": [None] * len(df), "pred_confidence": np.nan})
+        return empty, None
+
+    sutta = df["sutta_uid"].to_numpy()
+    # The notebook's row order, so that its folds, and therefore its score, carry over.
+    labelled = labelled[np.lexsort((df["chunk_index"].to_numpy()[labelled], sutta[labelled]))]
+
+    unit = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+    X, y = unit[labelled], gold_mode.to_numpy()[labelled].astype(str)
+    probe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, class_weight="balanced"))
+    folds = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
+    held_out = cross_val_predict(probe, X, y, groups=sutta[labelled], cv=folds, method="predict_proba")
+
+    proba = probe.fit(X, y).predict_proba(unit)
+    proba[labelled] = held_out
+    classes = probe.classes_
+    predictions = pd.DataFrame(
+        {"pred_mode": classes[proba.argmax(axis=1)], "pred_confidence": proba.max(axis=1)}
+    )
+    return predictions, float(f1_score(y, classes[held_out.argmax(axis=1)], average="macro"))
