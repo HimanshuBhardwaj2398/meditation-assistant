@@ -1,0 +1,36 @@
+# Datasette metadata for the corpus explorer snapshot (python -m atlas.explore).
+# Settings and stored queries live in explore_datasette.yaml.
+title: Pali Canon corpus explorer
+description_html: |-
+  <p>A read-only snapshot of the chunk embedding space, exported from the atlas cache by
+  <code>poetry run python -m atlas.explore</code>. Rebuild it after any ingestion; the build
+  refuses a stale cache.</p>
+  <p>Map positions (<code>x</code>, <code>y</code>) are for looking only. Neighbours, hubs and
+  pericope families come from the full 1024-dimensional vectors.</p>
+source: SuttaCentral
+source_url: https://suttacentral.net/
+databases:
+  explore:
+    tables:
+      suttas:
+        description: One row per sutta in the snapshot.
+      chunks:
+        description: One row per chunk, with its map position and the signals derived from its vector.
+        columns:
+          nikaya: "Collection: dn, mn, sn, an, or a Khuddaka book (dhp, iti, kp, snp, thag, thig, ud). DN and MN mix in the embedding space; SN, AN and the verse books each gather, because the collections differ in form."
+          x: UMAP of the centred vectors. For looking only; distance on the map is not similarity.
+          y: UMAP of the centred vectors. For looking only; distance on the map is not similarity.
+          hub_count: How many chunks list this one among their 10 nearest neighbours. Retrieval returns high scorers for almost any query.
+          neighbour_mix: Share of this chunk's 10 nearest neighbours that come from its own sutta. Low values mark shared formulas.
+          family_id: Pericope family, a group of near-duplicates at cosine 0.90 or above. Family 1 is the largest. Empty when the chunk has no near-duplicate.
+          family_size: Chunks in this chunk's pericope family, counting itself.
+          gold_mode: Human genre label from data/labels/genre_gold_v2.jsonl. Empty when unlabelled.
+          gold_is_verse: Human label, 1 when the chunk is verse.
+          gold_has_simile: Human label, 1 when the chunk contains a simile.
+          pred_mode: Probe prediction at 0.79 macro F1, not ground truth. Out-of-fold for gold-labelled rows.
+          pred_confidence: Probability of pred_mode. Low values are the best candidates to label next.
+      neighbours:
+        description: Each chunk's 10 nearest neighbours by raw cosine over the full 1024 dimensions, the similarity retrieval ranks by.
+        columns:
+          rank: 1 is the nearest neighbour.
+          cosine: Raw cosine similarity between the two chunks.
