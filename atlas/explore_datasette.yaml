@@ -1,0 +1,80 @@
+# Datasette 1.0 settings and stored queries for the corpus explorer snapshot.
+# Titles and column descriptions live in explore_metadata.yaml.
+databases:
+  explore:
+    tables:
+      suttas:
+        label_column: doc_title
+      chunks:
+        label_column: sutta_uid
+        facets:
+          - nikaya
+          - pred_mode
+          - gold_mode
+    queries:
+      largest_families:
+        title: Largest pericope families
+        description: Groups of near-duplicate chunks (cosine 0.90 or above), largest first, with the suttas each one spans.
+        sql: |-
+          select
+            family_id,
+            family_size,
+            count(distinct sutta_uid) as suttas,
+            group_concat(distinct sutta_uid) as sutta_uids,
+            substr(min(chunk_text), 1, 240) as sample
+          from chunks
+          where family_id is not null
+          group by family_id
+          order by family_size desc, family_id
+          limit 200
+      suttas_sharing_families:
+        title: Suttas that share pericope families with a sutta
+        description: Enter a sutta uid such as mn10. Lists the other suttas that repeat its formulas, most shared first.
+        sql: |-
+          select
+            other.sutta_uid,
+            suttas.doc_title,
+            suttas.nikaya,
+            count(distinct other.family_id) as shared_families
+          from chunks as mine
+          join chunks as other
+            on other.family_id = mine.family_id
+           and other.sutta_uid != mine.sutta_uid
+          join suttas on suttas.sutta_uid = other.sutta_uid
+          where mine.sutta_uid = :sutta_uid
+          group by other.sutta_uid
+          order by shared_families desc, other.sutta_uid
+          limit 200
+      top_hubs:
+        title: Top hubs
+        description: Chunks that appear in the most other chunks' 10 nearest neighbours. Retrieval tends to return these for almost any query.
+        sql: |-
+          select
+            uuid, sutta_uid, chunk_index, hub_count, neighbour_mix, family_size,
+            substr(chunk_text, 1, 300) as opening
+          from chunks
+          order by hub_count desc
+          limit 100
+      gold_vs_predicted:
+        title: Where the probe disagrees with a gold label
+        description: Gold-labelled chunks whose out-of-fold prediction differs, most confident first. Confident disagreements are the likeliest label errors.
+        sql: |-
+          select
+            uuid, sutta_uid, chunk_index, gold_mode, pred_mode,
+            round(pred_confidence, 3) as confidence,
+            substr(chunk_text, 1, 300) as opening
+          from chunks
+          where gold_mode is not null and pred_mode != gold_mode
+          order by pred_confidence desc
+      label_candidates:
+        title: Chunks to label next
+        description: Unlabelled chunks the probe is least sure about. Labels here are likely to help the probe most.
+        sql: |-
+          select
+            uuid, sutta_uid, chunk_index, pred_mode,
+            round(pred_confidence, 3) as confidence, word_count,
+            substr(chunk_text, 1, 300) as opening
+          from chunks
+          where gold_mode is null and pred_mode is not null
+          order by pred_confidence
+          limit 200
