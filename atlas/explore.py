@@ -38,9 +38,16 @@ from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from atlas.structure import exemplars
+from atlas.geometry import centre, hubness
+from atlas.pericopes import families
+from atlas.structure import exemplars, project
 
 logger = logging.getLogger(__name__)
+
+META_COLUMNS = ["uuid", "sutta_uid", "nikaya", "doc_title", "chunk_index", "word_count", "chunk_text"]
+FAMILY_THRESHOLD = 0.90
+UMAP_NEIGHBOURS = 15
+SEED = 42
 
 GOLD_PATH = Path("data/labels/genre_gold_v2.jsonl")
 GOLD_RENAME = {"mode": "gold_mode", "is_verse": "gold_is_verse", "has_simile": "gold_has_simile"}
@@ -193,3 +200,60 @@ def predict_genre(
         {"pred_mode": classes[proba.argmax(axis=1)], "pred_confidence": proba.max(axis=1)}
     )
     return predictions, float(f1_score(y, classes[held_out.argmax(axis=1)], average="macro"))
+
+
+def build(
+    vectors: np.ndarray, df: pd.DataFrame, gold: Optional[pd.DataFrame]
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """The snapshot: one row per chunk, the map labels, and the numbers behind them."""
+    table = df[META_COLUMNS].reset_index(drop=True).copy()
+
+    layout = project(centre(vectors), n_neighbors=UMAP_NEIGHBOURS, seed=SEED)
+    table["x"] = layout[:, 0].astype(float)
+    table["y"] = layout[:, 1].astype(float)
+
+    ids, cosines = neighbours(vectors)
+    table["neighbors"] = [
+        {"ids": row.tolist(), "distances": (1.0 - cos.astype(float)).tolist()}
+        for row, cos in zip(ids, cosines)
+    ]
+    table["hub_count"] = hubness(vectors, K)
+    table["neighbour_mix"] = neighbour_mix(ids, table)
+
+    components, family_stats = families(vectors, table, FAMILY_THRESHOLD)
+    family_id, family_size = number_families(components)
+    table["family_id"] = pd.Series(family_id, dtype="Int64").mask(family_id == 0)
+    table["family_size"] = family_size
+
+    stats: dict = {
+        "chunks": len(table),
+        "map": {
+            "method": "umap",
+            "vectors": "centred",
+            "metric": "cosine",
+            "n_neighbors": UMAP_NEIGHBOURS,
+            "min_dist": 0.1,
+            "seed": SEED,
+        },
+        "neighbours": {"k": K, "vectors": "raw", "metric": "cosine"},
+        "families": {"threshold": FAMILY_THRESHOLD, **family_stats},
+        "genre": None,
+    }
+
+    if gold is None:
+        for column in GOLD_COLUMNS + PRED_COLUMNS:
+            table[column] = None
+    else:
+        gold_columns, unmatched = attach_gold(table, gold)
+        predictions, score = predict_genre(vectors, table, gold_columns["gold_mode"])
+        table = pd.concat([table, gold_columns, predictions], axis=1)
+        stats["genre"] = {
+            "gold_labels": len(gold),
+            "matched": int(gold_columns["gold_mode"].notna().sum()),
+            "unmatched": unmatched,
+            "probe_oof_macro_f1": score,
+        }
+        if unmatched:
+            logger.warning("%d of %d gold labels matched no chunk.", unmatched, len(gold))
+
+    return table, family_labels(table, vectors), stats

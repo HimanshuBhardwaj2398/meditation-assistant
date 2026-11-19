@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -159,3 +160,54 @@ def test_gold_rows_get_out_of_fold_predictions():
     predictions, _ = explore.predict_genre(vectors, df, gold)
 
     assert (predictions["pred_mode"] == gold).mean() < 0.7
+
+
+@pytest.fixture
+def flat_projection(monkeypatch):
+    """UMAP is slow to import and nothing asserts on its layout, so use a fixed one."""
+
+    def layout(vectors, **_):
+        return np.column_stack([np.arange(len(vectors)), np.zeros(len(vectors))])
+
+    monkeypatch.setattr(explore, "project", layout)
+
+
+def _stub_probe(monkeypatch):
+    """Stand in for the probe where only the wiring around it is under test."""
+
+    def predict(vectors, df, gold_mode):
+        return pd.DataFrame({"pred_mode": ["doctrine"] * len(df), "pred_confidence": 0.5}), 0.8
+
+    monkeypatch.setattr(explore, "predict_genre", predict)
+
+
+def test_build_assembles_one_row_per_chunk(flat_projection):
+    vectors, df = _corpus()
+
+    table, labels, stats = explore.build(vectors, df, gold=None)
+
+    assert table["uuid"].tolist() == df["uuid"].tolist()
+    assert len(table.loc[0, "neighbors"]["ids"]) == explore.K
+    assert table["hub_count"].sum() == 12 * explore.K
+    assert table.loc[1, "family_id"] == 1 and table.loc[1, "family_size"] == 3
+    assert pd.isna(table.loc[0, "family_id"])
+    assert table["pred_mode"].isna().all()
+    assert stats["families"]["n_families"] == 1 and stats["genre"] is None
+    assert labels["text"].tolist()[0].startswith("3×")
+
+
+def test_build_attaches_gold_and_predictions(flat_projection, monkeypatch):
+    _stub_probe(monkeypatch)
+    vectors, df = _corpus()
+    gold = pd.DataFrame(
+        [
+            {"sutta_uid": "sn0", "chunk_index": 1, "mode": "practice", "is_verse": False, "has_simile": False},
+            {"sutta_uid": "zz", "chunk_index": 0, "mode": "doctrine", "is_verse": False, "has_simile": False},
+        ]
+    )
+
+    table, _, stats = explore.build(vectors, df, gold)
+
+    assert table.loc[1, "gold_mode"] == "practice"
+    assert (table["pred_mode"] == "doctrine").all()
+    assert stats["genre"] == {"gold_labels": 2, "matched": 1, "unmatched": 1, "probe_oof_macro_f1": 0.8}
