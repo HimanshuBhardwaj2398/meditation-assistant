@@ -1,5 +1,8 @@
 # Datasette 1.0 settings and stored queries for the corpus explorer snapshot.
 # Titles and column descriptions live in explore_metadata.yaml.
+settings:
+  # Above the 7,144 chunks, so ?_size=max and datasette-plot see the whole table.
+  max_returned_rows: 10000
 databases:
   explore:
     tables:

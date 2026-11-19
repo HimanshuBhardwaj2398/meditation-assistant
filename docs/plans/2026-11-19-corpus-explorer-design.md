@@ -40,7 +40,8 @@ Decisions made in brainstorming (2026-11-19):
 - **The atlas findings constrain the map**
   ([embedding atlas design](2026-08-16-embedding-atlas-design.md), measured on DN and MN).
   HDBSCAN left 76–100% of chunks unassigned, so the corpus has no topical clusters to draw.
-  The nikāya carried no semantic signal. One shared direction made up 64% of every vector.
+  The nikāya carried no semantic signal between DN and MN (section 11 revisits this on the
+  full canon). One shared direction made up 64% of every vector.
   The real discrete structure sat in the pericope families. Automatic cluster labels would
   invent structure the data lacks.
 - **Genre shows in the geometry.** The probe in `retrieval/genre_classifier_scaleup.ipynb`
@@ -146,6 +147,12 @@ median map position of its members and reads as the family size plus the opening
 the family exemplar, the member nearest the family centroid. The family size sets its
 priority.
 
+Embedding Atlas 0.26.0 needs two workarounds, found in the first browser run. Its docs name
+`text` for `--labels`, but its frontend renders `content` and throws on a label without it,
+so each label carries both. A label without a `level` shows only inside a narrow zoom
+window, so each label gets level 0; overlap placement by priority then decides which
+labels show at each zoom.
+
 ### Snapshot schema
 
 `explore.parquet` holds one row per chunk, in cache order. Row order matters: Embedding
@@ -236,8 +243,9 @@ checks those in the browser, against the script below.
 The definition of working, written before the build. It doubles as a first lesson in
 reading an embedding map.
 
-1. Colour the map by `nikaya`. Expect thorough mixing. Islands of one nikāya would point to
-   a loading or projection bug.
+1. Colour the map by `nikaya`. DN and MN should mix, as the atlas found. Where another
+   collection gathers, check the full-dimension neighbour lists before suspecting a loading
+   or projection bug: structure that the lists share is real (section 11).
 2. Colour by `pred_mode`. Do `practice` chunks form regions or scatter? Lasso a
    practice-heavy area and read five chunks.
 3. Click an MN 10 chunk. Its DN 22 twin should appear among the neighbours, the atlas's
@@ -270,3 +278,38 @@ the metadata file. That costs only the quick charts, and the map covers plotting
 - **An exploration page on the workbench website.** See section 2.
 - **Writing predictions to Postgres or `chunk_genre`, and any retrieval change.** Those go
   through the eval gate.
+
+## 11. First run (2026-11-19)
+
+The full canon: 7,144 chunks, exported in 41 seconds.
+
+- **The probe reproduces.** All 482 gold labels matched a chunk. Out-of-fold macro F1 came
+  to 0.792 and agreement to 82.8%, the scale-up notebook's numbers exactly. Median
+  confidence is 0.997 and the 10th percentile 0.743, so `label_candidates` draws from a
+  thin tail. The probe disagrees with 83 gold labels.
+- **Pericope families hold 45% of the canon** at cosine 0.90, in 703 families (19% on DN
+  and MN alone). The largest, 191 chunks across 188 suttas, is the Khandha Saṃyutta's
+  "At Sāvatthī. 'Mendicants, form is impermanent…'".
+- **The nikāya shows on the full canon.** Coloured by collection, the map does not mix: SN,
+  AN and the verse books each gather. The full-dimension neighbour lists agree, so the
+  projection did not invent it:
+
+  | Collection | Neighbours from the same collection | By chance |
+  |---|---|---|
+  | SN | 78% | 33% |
+  | AN | 73% | 33% |
+  | Theragāthā | 58% | 4% |
+  | Itivuttaka | 47% | 2% |
+
+  Leaving out a chunk's own sutta, 59% of its neighbours still share its collection. The
+  collections differ in form (verse books, AN's numbered lists, SN's topical chains), and
+  the vectors encode form. The atlas finding holds for DN against MN only.
+- **MN 10 and DN 22 pass.** Every one of MN 10's 15 chunks has its DN 22 twin as nearest
+  neighbour, mostly at cosine 1.000. The alignment runs down the diagonal and skips DN 22
+  chunks 13 to 20, the expanded Four Noble Truths section, which is the shape the atlas
+  predicted.
+- **Hubs:** AN 5.87's opening chunk sits in 74 other chunks' top 10; the median chunk sits
+  in 8.
+- **Gold labels live outside git.** `data/labels/` is untracked, so a fresh checkout or
+  worktree has no gold file and the build skips prediction. Pass `--gold` with the file's
+  path, or commit the labels.

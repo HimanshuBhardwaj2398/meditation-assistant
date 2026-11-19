@@ -17,7 +17,7 @@ databases:
       chunks:
         description: One row per chunk, with its map position and the signals derived from its vector.
         columns:
-          nikaya: "Collection: dn, mn, sn, an, or a Khuddaka book (dhp, iti, kp, snp, thag, thig, ud). The atlas found it carries no semantic signal."
+          nikaya: "Collection: dn, mn, sn, an, or a Khuddaka book (dhp, iti, kp, snp, thag, thig, ud). DN and MN mix in the embedding space; SN, AN and the verse books each gather, because the collections differ in form."
           x: UMAP of the centred vectors. For looking only; distance on the map is not similarity.
           y: UMAP of the centred vectors. For looking only; distance on the map is not similarity.
           hub_count: How many chunks list this one among their 10 nearest neighbours. Retrieval returns high scorers for almost any query.
