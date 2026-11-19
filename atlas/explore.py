@@ -202,9 +202,11 @@ def family_labels(
     by its size and the opening words of its exemplar, the member nearest the
     family centroid. Embedding Atlas shows higher priority labels first.
 
-    The name goes in both `text` and `content`: Embedding Atlas 0.26.0 documents
-    `text` for --labels, but its frontend renders `content` and crashes on a
-    label that lacks it.
+    Two workarounds for Embedding Atlas 0.26.0. The name goes in both `text` and
+    `content`, because its docs name `text` for --labels but its frontend renders
+    `content` and throws on a label without it. Every label gets level 0, because
+    a label without a level only shows inside a narrow zoom window; at one shared
+    level, priority alone decides which labels give way when they overlap.
     """
     ids = table["family_id"].fillna(0).to_numpy(dtype=np.int64)
     ids = np.where(table["family_size"].to_numpy() >= min_size, ids, 0)
@@ -225,10 +227,11 @@ def family_labels(
                 "y": float(np.median(y[members])),
                 "text": name,
                 "content": name,
+                "level": 0,
                 "priority": float(size),
             }
         )
-    return pd.DataFrame(rows, columns=["x", "y", "text", "content", "priority"])
+    return pd.DataFrame(rows, columns=["x", "y", "text", "content", "level", "priority"])
 
 
 def load_gold(path: Path = GOLD_PATH) -> Optional[pd.DataFrame]:
