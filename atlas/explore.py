@@ -201,6 +201,10 @@ def family_labels(
     Each label sits at the median position of its members and names the family
     by its size and the opening words of its exemplar, the member nearest the
     family centroid. Embedding Atlas shows higher priority labels first.
+
+    The name goes in both `text` and `content`: Embedding Atlas 0.26.0 documents
+    `text` for --labels, but its frontend renders `content` and crashes on a
+    label that lacks it.
     """
     ids = table["family_id"].fillna(0).to_numpy(dtype=np.int64)
     ids = np.where(table["family_size"].to_numpy() >= min_size, ids, 0)
@@ -214,15 +218,17 @@ def family_labels(
     for family in chosen.tolist():
         members = members_of == family
         size = int(members.sum())
+        name = f"{size}× {opening(text[exemplar[family]])}"
         rows.append(
             {
                 "x": float(np.median(x[members])),
                 "y": float(np.median(y[members])),
-                "text": f"{size}× {opening(text[exemplar[family]])}",
+                "text": name,
+                "content": name,
                 "priority": float(size),
             }
         )
-    return pd.DataFrame(rows, columns=["x", "y", "text", "priority"])
+    return pd.DataFrame(rows, columns=["x", "y", "text", "content", "priority"])
 
 
 def load_gold(path: Path = GOLD_PATH) -> Optional[pd.DataFrame]:

@@ -92,10 +92,12 @@ def test_family_labels_sit_at_member_medians_and_rank_by_size():
 
     labels = explore.family_labels(table, vectors, min_size=2)
 
-    assert labels.columns.tolist() == ["x", "y", "text", "priority"]
+    assert labels.columns.tolist() == ["x", "y", "text", "content", "priority"]
     assert labels["priority"].tolist() == [3.0, 2.0]
     assert labels.loc[0, ["x", "y"]].tolist() == [5.0, 10.0]
     assert labels.loc[0, "text"].startswith("3× Passage number")
+    # Embedding Atlas 0.26.0 documents `text` but its frontend renders `content`.
+    assert labels["content"].tolist() == labels["text"].tolist()
 
 
 def test_family_labels_skip_small_families_and_cap_the_count():
@@ -291,6 +293,7 @@ def test_write_parquet_keeps_embedding_atlas_neighbour_shape(snapshot, tmp_path)
         "x",
         "y",
         "text",
+        "content",
         "priority",
     ]
     assert not list(tmp_path.glob("*.partial"))
