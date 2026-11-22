@@ -181,9 +181,18 @@ class VectorStoreManager:
             raise VectorStoreError("Document and vector writes must use the same database URL")
 
     def stage_vectors(
-        self, session: Session, documents: List[Document], vectors: List[List[float]]
+        self,
+        session: Session,
+        documents: List[Document],
+        vectors: List[List[float]],
+        collection_name: Optional[str] = None,
     ) -> None:
-        """Flush vector rows using the caller's transaction."""
+        """Flush vector rows using the caller's transaction.
+
+        Args:
+            collection_name: The collection to write into: the document's own
+                collection. Defaults to this manager's configured collection.
+        """
         self.validate_database(session)
         ids = {doc.id for doc in documents}
         if None in ids or "" in ids or len(ids) != len(documents):
@@ -194,9 +203,10 @@ class VectorStoreManager:
         # The legacy store initializes its schema/collection independently. Its
         # models can then use the application's session for all document data.
         store = self.vector_store
-        collection = store.get_collection(session)
+        name = collection_name or self.config.collection_name
+        collection = store.CollectionStore.get_by_name(session, name)
         if collection is None:
-            raise VectorStoreError(f"Vector collection {self.config.collection_name!r} not found")
+            raise VectorStoreError(f"Vector collection {name!r} not found")
         session.add_all(
             store.EmbeddingStore(
                 document=doc.page_content,
@@ -230,6 +240,32 @@ class VectorStoreManager:
             match = or_(match, embedding.custom_id.in_(chunk_ids))
         return session.query(embedding).filter(match).delete(synchronize_session=False)
 
+    def collection_of_document(self, session: Session, document_id: int) -> Optional[str]:
+        """The collection a document's existing vectors are in, if they agree on one.
+
+        Used for documents ingested before the collection was recorded on the
+        document. Returns None when the document has no vectors, or when they
+        are split across collections (logged; nothing to inherit then).
+        """
+        self.validate_database(session)
+        store = self.vector_store
+        embedding, collection = store.EmbeddingStore, store.CollectionStore
+        names = [
+            name
+            for (name,) in session.query(collection.name)
+            .join(embedding, embedding.collection_id == collection.uuid)
+            .filter(embedding.cmetadata["document_id"].astext == str(document_id))
+            .distinct()
+        ]
+        if len(names) > 1:
+            logger.warning(
+                "Document %s has vectors in several collections %s; none inherited",
+                document_id,
+                sorted(names),
+            )
+            return None
+        return names[0] if names else None
+
     def embed_documents(self, documents: List[Document]) -> List[str]:
         """Compute and write vectors for callers without relational chunk persistence."""
         if not documents:
@@ -259,62 +295,3 @@ class VectorStoreManager:
             "batch_size": self.config.batch_size,
             "use_jsonb": self.config.use_jsonb,
         }
-
-    def delete_by_ids(self, ids: List[str]) -> int:
-        """
-        Delete embeddings by their UUIDs.
-
-        Args:
-            ids: List of embedding UUIDs to delete.
-
-        Returns:
-            Number of embeddings deleted (based on input count).
-
-        Raises:
-            VectorStoreError: If deletion fails.
-        """
-        if not ids:
-            logger.warning("No IDs provided for deletion")
-            return 0
-
-        try:
-            logger.info(f"Deleting {len(ids)} embeddings from vector store")
-            self.vector_store.delete(ids=ids)
-            logger.info(f"Successfully deleted {len(ids)} embeddings")
-            return len(ids)
-
-        except Exception as e:
-            error_msg = f"Failed to delete embeddings: {e}"
-            logger.error(error_msg)
-            raise VectorStoreError(error_msg) from e
-
-    def delete_by_metadata_filter(self, filter: Dict[str, Any]) -> bool:
-        """
-        Delete embeddings matching a metadata filter.
-
-        Uses LangChain PGVector's filter support for metadata-based deletion.
-        Useful for deleting all embeddings for a specific document.
-
-        Args:
-            filter: Metadata filter dict (e.g., {"original_doc_id": 123})
-
-        Returns:
-            True if deletion completed successfully.
-
-        Raises:
-            VectorStoreError: If deletion fails.
-        """
-        if not filter:
-            logger.warning("No filter provided for deletion")
-            return False
-
-        try:
-            logger.info(f"Deleting embeddings with filter: {filter}")
-            self.vector_store.delete(filter=filter)
-            logger.info("Successfully deleted embeddings by filter")
-            return True
-
-        except Exception as e:
-            error_msg = f"Failed to delete embeddings by filter: {e}"
-            logger.error(error_msg)
-            raise VectorStoreError(error_msg) from e

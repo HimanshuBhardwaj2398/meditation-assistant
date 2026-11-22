@@ -24,7 +24,7 @@ from core.exceptions import (
     ProcessingLeaseLostError,
 )
 from core.interfaces import PipelineContext, PipelineStage, StageStatus
-from ingestion.admission import AdmissionOutcome, admit
+from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.parsing import ParserFactory
@@ -258,6 +258,8 @@ class _PreparedRun:
     chunks: List[LangchainDocument] = field(default_factory=list)
     stage_results: Dict[str, StageStatus] = field(default_factory=dict)
     source_metadata: Dict[str, Any] = field(default_factory=dict)
+    # The document's own vector collection; publishing writes there.
+    vector_collection: Optional[str] = None
 
 
 class IngestionOrchestrator:
@@ -380,7 +382,7 @@ class IngestionOrchestrator:
                 raise PipelineError(
                     "reprocess_mode can only be used when source is an existing document ID"
                 )
-            admission = admit(source, title=title)
+            admission = self.admit(source, title=title)
             if admission.outcome == AdmissionOutcome.COMPLETED:
                 return self._existing_result(admission.document_id)
             document_id = admission.document_id
@@ -389,6 +391,26 @@ class IngestionOrchestrator:
         if run is None:
             return self._existing_result(document_id)
         return await self._run_pipeline(run, mode, on_stage_update)
+
+    def admit(
+        self,
+        source: str,
+        *,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        doc_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Admission:
+        """Find or create the document for a source (see ``ingestion.admission``).
+
+        A new document records this orchestrator's vector collection as its
+        own, so later retries and reprocesses publish there too.
+        """
+        metadata = {
+            **(doc_metadata or {}),
+            VECTOR_COLLECTION_KEY: self.vector_store_config.collection_name,
+        }
+        return admit(source, title=title, description=description, tags=tags, doc_metadata=metadata)
 
     # ------------------------------------------------------------------
     # Preparing a document
@@ -452,11 +474,41 @@ class IngestionOrchestrator:
                 replacing=was_completed,
             )
             self._seed(run, doc, ChunkCRUD(session), mode)
+            if self.enable_database_persistence:
+                run.vector_collection = self._resolve_collection(session, doc)
             if clear_markdown:
                 doc.markdown = None
 
         logger.info("Document %s claimed for %s", document_id, mode.value if mode else "processing")
         return run
+
+    def _resolve_collection(self, session: Any, doc: Any) -> str:
+        """The document's own vector collection, recorded on it if it lacked one.
+
+        Retries and reprocesses publish into the document's collection,
+        whatever collection this orchestrator is configured for. A document
+        ingested before collections were recorded inherits the collection its
+        vectors are already in, or else gets the configured one.
+        """
+        metadata = dict(doc.doc_metadata or {})
+        collection = metadata.get(VECTOR_COLLECTION_KEY)
+        if collection:
+            if collection != self.vector_store_config.collection_name:
+                logger.info(
+                    "Document %s stays in its own collection %r (not %r)",
+                    doc.id,
+                    collection,
+                    self.vector_store_config.collection_name,
+                )
+            return collection
+
+        collection = (
+            self.vector_store_manager.collection_of_document(session, doc.id)
+            or self.vector_store_config.collection_name
+        )
+        metadata[VECTOR_COLLECTION_KEY] = collection
+        doc.doc_metadata = metadata
+        return collection
 
     @staticmethod
     def _seed(
@@ -572,6 +624,7 @@ class IngestionOrchestrator:
             stage_results=run.stage_results,
             source_metadata=run.source_metadata,
             processing_token=run.token,
+            vector_collection=run.vector_collection,
         )
 
         try:

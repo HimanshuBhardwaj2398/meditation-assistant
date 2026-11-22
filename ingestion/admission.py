@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 _SUTTACENTRAL = SuttaCentralParser()
 
+# doc_metadata key naming the vector collection a document belongs to.
+VECTOR_COLLECTION_KEY = "vector_collection"
+
 
 def canonical_source(source: str) -> str:
     """The form a source is stored and compared in (``documents.file_path``).

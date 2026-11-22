@@ -6,10 +6,13 @@ faked. The fake vector store writes its rows through the caller's session, so a
 rolled-back publication rolls its vectors back too, as it does on pgvector.
 """
 
+import os
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 from config.settings import DatabaseSettings
 from core.interfaces import ParseResult
@@ -85,6 +88,8 @@ class SessionVectorStore:
         # Called at the start of each compute_embeddings, e.g. to simulate
         # another run acting on the document mid-run.
         self.before_embedding: Optional[Callable[[], None]] = None
+        # document_id -> the collection its (pretend) existing vectors are in.
+        self.existing_collections: Dict[int, str] = {}
 
     def validate_database(self, session: Any) -> None:
         pass
@@ -109,32 +114,37 @@ class SessionVectorStore:
             ).rowcount
         return deleted
 
-    def stage_vectors(self, session: Any, documents: List[Any], vectors: List[Any]) -> None:
+    def stage_vectors(
+        self,
+        session: Any,
+        documents: List[Any],
+        vectors: List[Any],
+        collection_name: Optional[str] = None,
+    ) -> None:
         for doc, _vector in zip(documents, vectors, strict=True):
             session.execute(
                 text(
-                    "INSERT INTO fake_vectors (custom_id, document_id, document) "
-                    "VALUES (:custom_id, :document_id, :document)"
+                    "INSERT INTO fake_vectors (custom_id, document_id, document, collection) "
+                    "VALUES (:custom_id, :document_id, :document, :collection)"
                 ),
                 {
                     "custom_id": doc.id,
                     "document_id": doc.metadata.get("document_id"),
                     "document": doc.page_content,
+                    "collection": collection_name,
                 },
             )
 
-    def delete_by_ids(self, ids: List[str]) -> int:
-        with self.db.session_scope() as session:
-            for custom_id in ids:
-                session.execute(
-                    text("DELETE FROM fake_vectors WHERE custom_id = :id"), {"id": custom_id}
-                )
-        return len(ids)
+    def collection_of_document(self, session: Any, document_id: int) -> Optional[str]:
+        return self.existing_collections.get(document_id)
 
     def rows(self) -> List[Dict[str, Any]]:
         with self.db.session_scope() as session:
             result = session.execute(
-                text("SELECT custom_id, document_id, document FROM fake_vectors ORDER BY rowid")
+                text(
+                    "SELECT custom_id, document_id, document, collection "
+                    "FROM fake_vectors ORDER BY rowid"
+                )
             )
             return [dict(row._mapping) for row in result]
 
@@ -148,7 +158,7 @@ def ingest_db(tmp_path, monkeypatch) -> Database:
         connection.execute(
             text(
                 "CREATE TABLE fake_vectors "
-                "(custom_id TEXT PRIMARY KEY, document_id INTEGER, document TEXT)"
+                "(custom_id TEXT PRIMARY KEY, document_id INTEGER, document TEXT, collection TEXT)"
             )
         )
     monkeypatch.setattr(database_module, "_default_database", db)
@@ -174,3 +184,32 @@ def orchestrator(parser, vectors) -> IngestionOrchestrator:
         parser_factory=parser,
         vector_store_manager=vectors,
     )
+
+
+@pytest.fixture
+def postgres_database(monkeypatch):
+    """The real schema in a throwaway schema of a disposable pgvector database.
+
+    Skipped unless INGESTION_TEST_POSTGRES_URL is set; never point it at Neon.
+    """
+    url = os.environ.get("INGESTION_TEST_POSTGRES_URL")
+    if not url:
+        pytest.skip("Set INGESTION_TEST_POSTGRES_URL to a disposable pgvector test database")
+
+    admin = create_engine(url)
+    schema = f"ingestion_test_{uuid4().hex}"
+    with admin.begin() as connection:
+        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    isolated_url = make_url(url).update_query_dict({"options": f"-csearch_path={schema},public"})
+    db = Database(DatabaseSettings(url=isolated_url.render_as_string(hide_password=False)))
+    try:
+        Base.metadata.create_all(db.engine)
+        monkeypatch.setattr(database_module, "_default_database", db)
+        yield db
+    finally:
+        db.engine.dispose()
+        with admin.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()

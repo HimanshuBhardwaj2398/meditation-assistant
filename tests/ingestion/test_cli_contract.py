@@ -221,3 +221,22 @@ def test_bulk_main_accounts_for_workers(cli_modules, monkeypatch, tmp_path, outc
         assert exc.value.code == 1
         if outcome in ("crash", "missing"):
             assert "<worker 0>" in (tmp_path / "data" / "ingest_failures.json").read_text()
+
+
+async def test_ingest_cli_defaults_to_the_configured_collection(cli_modules, monkeypatch):
+    """scripts/ingest.py once defaulted to meditation_chunks, which retrieval never searches."""
+    cli = cli_modules.ingest
+    monkeypatch.setenv("DB_URL", "postgresql://u:p@localhost/cli")
+    monkeypatch.setenv("VECTOR_COLLECTION_NAME", "from_settings")
+    built = {}
+
+    def build(vector_store_config, **kwargs):
+        built["collection"] = vector_store_config.collection_name
+        result = {"document_id": 7, "chunk_count": 1, "success": True, "errors": {}}
+        return SimpleNamespace(process=AsyncMock(return_value=result))
+
+    monkeypatch.setattr(cli, "IngestionOrchestrator", build)
+
+    await cli.ingest_batch(["sc:mn1/sujato"], verbose=False)
+
+    assert built["collection"] == "from_settings"

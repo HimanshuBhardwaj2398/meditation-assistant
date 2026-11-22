@@ -1,21 +1,15 @@
 """Run against disposable pgvector with INGESTION_TEST_POSTGRES_URL set."""
 
-import os
 from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import inspect, text
 
-from config.settings import DatabaseSettings
 from core.exceptions import DatabaseError, EmbeddingError
 from core.interfaces import ParseResult
-from db import database
 from db.crud import DocumentCRUD
-from db.schema import Base
 from ingestion import stages
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.orchestrator import IngestionOrchestrator
@@ -47,31 +41,6 @@ def test_embedding_batch_failure_does_not_initialize_vector_store(monkeypatch):
         manager.compute_embeddings(
             [Document(page_content="First chunk"), Document(page_content="Second chunk")]
         )
-
-
-@pytest.fixture
-def postgres_database(monkeypatch):
-    url = os.environ.get("INGESTION_TEST_POSTGRES_URL")
-    if not url:
-        pytest.skip("Set INGESTION_TEST_POSTGRES_URL to a disposable pgvector test database")
-
-    admin = create_engine(url)
-    schema = f"ingestion_test_{uuid4().hex}"
-    with admin.begin() as connection:
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-
-    isolated_url = make_url(url).update_query_dict({"options": f"-csearch_path={schema},public"})
-    db = database.Database(DatabaseSettings(url=isolated_url.render_as_string(hide_password=False)))
-    try:
-        Base.metadata.create_all(db.engine)
-        monkeypatch.setattr(database, "_default_database", db)
-        yield db
-    finally:
-        db.engine.dispose()
-        with admin.begin() as connection:
-            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        admin.dispose()
 
 
 @pytest.mark.integration

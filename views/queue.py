@@ -9,6 +9,7 @@ import streamlit as st
 from db.crud import DocumentCRUD
 from db.database import session_scope
 from db.schema import DocumentStatus
+from services.collection_service import CollectionService
 from services.ingestion_service import process_document_by_id
 
 
@@ -184,7 +185,10 @@ def _render_failed_section(failed_docs: list):
                     st.rerun()
 
                 if st.button("Delete", key=f"del_failed_{doc.id}", type="secondary"):
-                    with session_scope() as del_session:
-                        if DocumentCRUD(del_session).delete_document(doc.id):
-                            st.success(f"Deleted document {doc.id}")
-                            st.rerun()
+                    # The shared cleanup, so any vectors the document has go too.
+                    result = CollectionService().delete_document_complete_sync(doc.id)
+                    if result.success:
+                        st.success(f"Deleted document {doc.id}")
+                        st.rerun()
+                    else:
+                        st.error(f"Delete failed: {result.error}")

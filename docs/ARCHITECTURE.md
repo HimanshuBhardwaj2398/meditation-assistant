@@ -53,7 +53,7 @@ flowchart LR
 | [`views/`](../views/) | Streamlit pages, wired by [`app.py`](../app.py) | `ingest`, `queue`, `browse`, `document_detail`, `stats`, `validation`, `rag_playground` |
 | [`observability/`](../observability/) | Optional tracing | [`langfuse.py`](../observability/langfuse.py): `LangfuseTracer`, `get_langfuse_tracer` — no-ops unless keys are configured |
 | [`core/`](../core/) | Contracts shared by all layers | [`interfaces.py`](../core/interfaces.py): `Parser` protocol, `PipelineStage` ABC, frozen `PipelineContext` · [`exceptions.py`](../core/exceptions.py): `MeditationDBError` hierarchy |
-| [`config/`](../config/) | Pydantic Settings | [`settings.py`](../config/settings.py): nested `Settings` (database, embedding, parsing, chunking, langfuse, vector). The designated config boundary (design doc [D4](plans/2026-07-10-architecture-hardening-retrieval-foundations-design.md)): ingestion-side env fallbacks route through settings, pinned by [`tests/test_config_boundary.py`](../tests/test_config_boundary.py); a few direct `os.getenv` reads remain in [`retrieval/`](../retrieval/) and [`collection_service.py`](../services/collection_service.py) |
+| [`config/`](../config/) | Pydantic Settings | [`settings.py`](../config/settings.py): nested `Settings` (database, embedding, parsing, chunking, ingestion, langfuse, vector). The designated config boundary (design doc [D4](plans/2026-07-10-architecture-hardening-retrieval-foundations-design.md)): ingestion-side env fallbacks route through settings, pinned by [`tests/test_config_boundary.py`](../tests/test_config_boundary.py); outside `config/` and the CLI scripts nothing reads the environment directly (ruff rule TID251) |
 | [`scripts/`](../scripts/) | Operational CLIs | [`ingest_one.py`](../scripts/ingest_one.py), [`ingest_batch.py`](../scripts/ingest_batch.py), [`build_catalog.py`](../scripts/build_catalog.py), [`ingest.py`](../scripts/ingest.py), [`rebuild_toc.py`](../scripts/rebuild_toc.py), [`validate_chunk_toc_integrity.py`](../scripts/validate_chunk_toc_integrity.py), [`verify_database.py`](../scripts/verify_database.py), [`check_doc_links.py`](../scripts/check_doc_links.py) |
 | [`alembic/`](../alembic/) | Schema migrations | `alembic upgrade head` creates the initial documents/chunks schema |
 
@@ -192,7 +192,16 @@ LangChain-managed vector table:
 Embeddings are partitioned into PGVector **collections** by source type. The
 default is `buddhist_texts` ([`VectorSettings.collection_name`](../config/settings.py),
 `VECTOR_COLLECTION_NAME` env var); ingestion CLIs and services accept a
-collection argument to route a source elsewhere (e.g. `talks`).
+collection argument to route a *new* source elsewhere (e.g. `talks`). A
+document keeps its collection: admission records it in
+`doc_metadata.vector_collection`, and every retry and reprocess publishes there,
+whatever the caller is configured for. A document from before that was recorded
+inherits the collection its vectors are in. Deleting a document
+(`CollectionService.delete_document_complete`, used by the Browse and Queue
+pages) removes the row, its chunks and all its vectors in one transaction.
+`scripts/verify_database.py --consistency-only` checks, read-only, that chunk
+rows and vectors still match one to one; `--delete-orphan-vectors` shows (and
+with `--apply` deletes) pipeline vectors whose chunk row is gone.
 
 ## Design decisions
 

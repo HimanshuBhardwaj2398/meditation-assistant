@@ -8,7 +8,6 @@ import asyncio
 from typing import Callable, Optional
 
 from core.interfaces import StageStatus
-from ingestion.admission import admit
 from ingestion.embed import VectorStoreConfig
 from ingestion.orchestrator import IngestionOrchestrator, IngestionResult
 
@@ -76,16 +75,17 @@ async def ingest_document_async(
     if category:
         all_tags.append(f"category:{category}")
 
-    # Find or create the document; the metadata applies only to a new one.
-    admission = admit(
+    orchestrator = get_orchestrator(collection_name)
+
+    # Find or create the document; the metadata (and the collection) apply
+    # only to a new one. An existing document keeps its own collection.
+    admission = orchestrator.admit(
         source,
         title=title,
         description=description,
         tags=all_tags,
         doc_metadata=metadata,
     )
-
-    orchestrator = get_orchestrator(collection_name)
     return await orchestrator.process(
         source=admission.document_id,
         title=title,

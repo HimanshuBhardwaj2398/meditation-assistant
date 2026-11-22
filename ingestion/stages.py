@@ -449,7 +449,9 @@ class DatabasePersistenceStage(PipelineStage):
                     removed_vectors,
                 )
 
-            self.vector_store_manager.stage_vectors(session, context.chunks, context.vectors)
+            self.vector_store_manager.stage_vectors(
+                session, context.chunks, context.vectors, context.vector_collection
+            )
 
             # Save chunks to database
             created_chunks = chunk_crud.create_chunks_batch(

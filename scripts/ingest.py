@@ -35,7 +35,6 @@ Examples:
 import argparse
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -165,7 +164,7 @@ async def ingest_batch(
     sources: List[str],
     titles: Optional[List[str]] = None,
     verbose: bool = True,
-    collection_name: str = "meditation_chunks",
+    collection_name: Optional[str] = None,
     reprocess_mode: Optional[str] = None,
     clear_markdown: bool = False,
 ) -> List[dict]:
@@ -176,7 +175,9 @@ async def ingest_batch(
         sources: List of URLs, file paths, or document IDs
         titles: Optional list of custom titles (must match sources length)
         verbose: Print detailed progress
-        collection_name: Name of the collection to store embeddings in
+        collection_name: Collection for new documents' embeddings; None means the
+            configured default (VECTOR_COLLECTION_NAME). An existing document
+            keeps its own collection.
         reprocess_mode: Optional mode for reprocessing existing docs
         clear_markdown: Clear stored markdown before reprocessing (full mode only)
 
@@ -186,14 +187,13 @@ async def ingest_batch(
     if titles is not None and len(titles) != len(sources):
         raise ValueError("titles must contain exactly one entry per source")
 
-    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
-
-    orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(
-            collection_name=collection_name,
-            db_url=db_url,
-        )
+    # The database URL comes from settings (DB_URL), the same as session_scope's.
+    config = (
+        VectorStoreConfig(collection_name=collection_name)
+        if collection_name
+        else VectorStoreConfig()
     )
+    orchestrator = IngestionOrchestrator(vector_store_config=config)
 
     results = []
     titles = titles if titles is not None else [None] * len(sources)
@@ -328,8 +328,11 @@ def main():
     parser.add_argument(
         "--collection",
         "-c",
-        default="meditation_chunks",
-        help="Collection name for storing embeddings (default: meditation_chunks)",
+        default=None,
+        help=(
+            "Collection for new documents' embeddings (default: VECTOR_COLLECTION_NAME, "
+            "normally buddhist_texts); existing documents keep their own"
+        ),
     )
 
     args = parser.parse_args()

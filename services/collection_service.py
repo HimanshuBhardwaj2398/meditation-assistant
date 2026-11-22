@@ -8,10 +8,10 @@ This service should be used for all delete operations to prevent orphaned embedd
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from config.settings import DatabaseSettings, VectorSettings
-from core.exceptions import DocumentNotFoundError, VectorStoreError
+from core.exceptions import DocumentNotFoundError
 from db.crud import ChunkCRUD, DocumentCRUD, get_all_collections
 from db.database import session_scope
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
@@ -94,16 +94,13 @@ class CollectionService:
         document_id: int,
     ) -> DeleteResult:
         """
-        Delete document with all associated data (atomic operation).
+        Delete a document, its chunk rows and all its vectors, in one transaction.
 
-        Order of operations (critical for data integrity):
-        1. Get chunk UUIDs from app database
-        2. Delete embeddings from vector store FIRST
-        3. Delete document from app database (chunks cascade via FK)
-
-        This order ensures:
-        - If vector delete fails, app DB is unchanged (safe rollback)
-        - If app DB delete fails after vector delete, we can retry
+        The document row is locked first, so a run publishing this document at
+        the same moment finishes before the delete reads what to remove.
+        Vectors are matched by chunk UUID and by the document id they carry,
+        which also removes any an older pipeline left without chunk rows. If any
+        step fails, nothing is deleted.
 
         Args:
             document_id: ID of document to delete
@@ -113,68 +110,44 @@ class CollectionService:
 
         Raises:
             DocumentNotFoundError: If document doesn't exist
-            CollectionError: If deletion fails
         """
-        # Step 1: Get document and chunk UUIDs from app DB
-        with session_scope() as session:
-            doc_crud = DocumentCRUD(session)
-            chunk_crud = ChunkCRUD(session)
+        doc_title = "Unknown"
+        try:
+            with session_scope() as session:
+                doc_crud = DocumentCRUD(session)
+                doc = doc_crud.get_document_for_update(document_id)
+                if not doc:
+                    raise DocumentNotFoundError(f"Document {document_id} not found")
+                doc_title = doc.title
 
-            doc = doc_crud.get_document_by_id(document_id)
-            if not doc:
-                raise DocumentNotFoundError(f"Document {document_id} not found")
-
-            chunks = chunk_crud.get_chunks_by_document(document_id)
-            chunk_uuids = [c.uuid for c in chunks]
-            doc_title = doc.title
-            chunk_count = len(chunks)
-
-        logger.info(f"Deleting document {document_id} '{doc_title}' with {chunk_count} chunks")
-
-        # Step 2: Delete from vector store FIRST
-        embeddings_deleted = 0
-        if chunk_uuids:
-            try:
-                embeddings_deleted = self.vector_store_manager.delete_by_ids(chunk_uuids)
-                logger.info(f"Deleted {embeddings_deleted} embeddings from vector store")
-            except VectorStoreError as e:
-                logger.error(f"Vector store delete failed: {e}")
-                return DeleteResult(
-                    document_id=document_id,
-                    title=doc_title,
-                    chunks_deleted=0,
-                    embeddings_deleted=0,
-                    success=False,
-                    error=f"Vector store delete failed: {e}",
+                chunk_uuids = [
+                    chunk.uuid for chunk in ChunkCRUD(session).get_chunks_by_document(document_id)
+                ]
+                embeddings_deleted = self.vector_store_manager.delete_document_vectors(
+                    session, document_id, chunk_uuids
                 )
-
-        # Step 3: Delete from app database
-        with session_scope() as session:
-            doc_crud = DocumentCRUD(session)
-
-            if not doc_crud.delete_document(document_id):
-                # This shouldn't happen since we verified doc exists above
-                logger.error(
-                    f"App DB delete failed for document {document_id} (embeddings already deleted)"
-                )
-                return DeleteResult(
-                    document_id=document_id,
-                    title=doc_title,
-                    chunks_deleted=0,
-                    embeddings_deleted=embeddings_deleted,
-                    success=False,
-                    error="App DB delete failed (embeddings already deleted - manual cleanup may be needed)",
-                )
+                doc_crud.delete_document(document_id)  # chunk rows cascade
+        except DocumentNotFoundError:
+            raise
+        except Exception as e:
+            logger.error(f"Delete failed for document {document_id}; nothing was deleted: {e}")
+            return DeleteResult(
+                document_id=document_id,
+                title=doc_title,
+                chunks_deleted=0,
+                embeddings_deleted=0,
+                success=False,
+                error=f"Delete failed; nothing was deleted: {e}",
+            )
 
         logger.info(
-            f"Successfully deleted document {document_id}: "
-            f"{chunk_count} chunks, {embeddings_deleted} embeddings"
+            f"Deleted document {document_id} '{doc_title}': "
+            f"{len(chunk_uuids)} chunks, {embeddings_deleted} embeddings"
         )
-
         return DeleteResult(
             document_id=document_id,
             title=doc_title,
-            chunks_deleted=chunk_count,
+            chunks_deleted=len(chunk_uuids),
             embeddings_deleted=embeddings_deleted,
             success=True,
         )
@@ -366,32 +339,3 @@ class CollectionService:
         """
         with session_scope() as session:
             return get_all_collections(session)
-
-    def get_collection_stats(
-        self,
-        collection_name: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Get statistics for a collection.
-
-        Args:
-            collection_name: Collection name (defaults to current)
-
-        Returns:
-            Dict with document_count, chunk_count, and collection metadata
-        """
-        target_collection = collection_name or self.collection_name
-
-        with session_scope() as session:
-            doc_crud = DocumentCRUD(session)
-            chunk_crud = ChunkCRUD(session)
-
-            all_docs = doc_crud.get_all_documents()
-            total_chunks = sum(len(chunk_crud.get_chunks_by_document(doc.id)) for doc in all_docs)
-
-        return {
-            "collection_name": target_collection,
-            "document_count": len(all_docs),
-            "chunk_count": total_chunks,
-            "vector_store_info": self.vector_store_manager.get_collection_info(),
-        }

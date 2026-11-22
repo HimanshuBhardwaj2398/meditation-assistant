@@ -128,6 +128,9 @@ class PipelineContext:
     # The claim this run holds on the document; publishing checks it.
     processing_token: Optional[str] = None
 
+    # The vector collection the document belongs to; publishing writes there.
+    vector_collection: Optional[str] = None
+
     def with_update(self, **kwargs) -> "PipelineContext":
         """
         Create new context with updated fields (immutable pattern).

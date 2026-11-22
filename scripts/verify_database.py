@@ -1,9 +1,22 @@
 """
 Verification script for database setup.
-Run this after Sprint 2 Phase 2 to ensure everything is configured correctly.
+
+Usage:
+    poetry run python scripts/verify_database.py                     # all checks
+    poetry run python scripts/verify_database.py --consistency-only  # read-only checks
+    poetry run python scripts/verify_database.py --delete-orphan-vectors          # dry run
+    poetry run python scripts/verify_database.py --delete-orphan-vectors --apply  # delete
+
+The full run includes a CRUD check that writes (and removes) a test document;
+``--consistency-only`` skips it and only reads.
 """
 
+import argparse
 import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import OperationalError
@@ -12,6 +25,7 @@ from config.settings import get_settings
 from db.crud import DocumentCRUD
 from db.database import engine, session_scope
 from db.schema import DocumentStatus
+from db.vector_consistency import check_vector_consistency, delete_orphan_vectors
 
 
 def verify_connection():
@@ -186,25 +200,103 @@ def verify_settings():
     return all_ok
 
 
-def main():
-    """Run all verification checks."""
+def verify_vector_consistency():
+    """Check that chunk rows and vectors still match one to one (read-only)."""
+    print("\nChecking chunk rows against vectors...")
+    try:
+        with session_scope() as session:
+            report = check_vector_consistency(session)
+    except Exception as e:
+        print(f"   ✗ Consistency check failed: {e}")
+        return False
+
+    print(f"   {report.chunks} chunk rows, {report.vectors} vectors")
+    for label, count in (
+        ("pipeline vectors with no chunk row", report.orphan_vectors),
+        ("chunk rows with no vector", report.chunks_without_vectors),
+        ("vectors naming a deleted document", report.vectors_of_missing_documents),
+    ):
+        print(f"   {'✓' if count == 0 else '✗'} {label}: {count}")
+    if report.foreign_vectors:
+        print(
+            f"   ℹ {report.foreign_vectors} vectors carry no document_id "
+            "(not written by this pipeline; left alone)"
+        )
+    if report.orphan_vector_sample:
+        print(f"     e.g. {report.orphan_vector_sample}")
+        print("     Review, then: scripts/verify_database.py --delete-orphan-vectors [--apply]")
+    if report.documents_missing_vectors:
+        print(
+            f"     Documents to re-embed (scripts/ingest.py --reprocess ID "
+            f"--reprocess-mode from_embedding): {report.documents_missing_vectors}"
+        )
+    return report.consistent
+
+
+def delete_orphan_vectors_command(apply: bool) -> int:
+    """Show (and with apply, delete) pipeline vectors whose chunk row is gone."""
+    with session_scope() as session:
+        report = check_vector_consistency(session)
+        print(f"{report.orphan_vectors} pipeline vectors have no chunk row.")
+        if report.orphan_vector_sample:
+            print(f"e.g. {report.orphan_vector_sample}")
+        if not report.orphan_vectors:
+            return 0
+        if not apply:
+            print("Dry run: nothing was deleted. Add --apply to delete them.")
+            return 0
+        deleted = delete_orphan_vectors(session)
+    print(f"Deleted {deleted} vectors.")
+    return 0
+
+
+def main(argv=None):
+    """Run the verification checks."""
+    parser = argparse.ArgumentParser(description="Verify the database setup and its data.")
+    parser.add_argument(
+        "--consistency-only",
+        action="store_true",
+        help="run only the read-only checks (skips the CRUD check, which writes)",
+    )
+    parser.add_argument(
+        "--delete-orphan-vectors",
+        action="store_true",
+        help="show pipeline vectors that have no chunk row (dry run unless --apply)",
+    )
+    parser.add_argument("--apply", action="store_true", help="with --delete-orphan-vectors")
+    args = parser.parse_args(argv)
+
+    if args.apply and not args.delete_orphan_vectors:
+        parser.error("--apply only goes with --delete-orphan-vectors")
+    if args.delete_orphan_vectors:
+        return delete_orphan_vectors_command(apply=args.apply)
+
     print("=" * 60)
-    print("Database Setup Verification - Sprint 2 Phase 2")
+    print("Database Setup Verification")
     print("=" * 60)
 
-    checks = [
-        verify_connection(),
-        verify_pgvector(),
-        verify_tables(),
-        verify_document_schema(),
-        verify_chunk_schema(),
-        verify_crud_operations(),
-        verify_settings(),
-    ]
+    if args.consistency_only:
+        checks = [
+            verify_connection(),
+            verify_pgvector(),
+            verify_tables(),
+            verify_vector_consistency(),
+        ]
+    else:
+        checks = [
+            verify_connection(),
+            verify_pgvector(),
+            verify_tables(),
+            verify_document_schema(),
+            verify_chunk_schema(),
+            verify_crud_operations(),
+            verify_settings(),
+            verify_vector_consistency(),
+        ]
 
     print("\n" + "=" * 60)
     if all(checks):
-        print("✓ ALL CHECKS PASSED - Database setup complete!")
+        print("✓ ALL CHECKS PASSED")
         print("=" * 60)
         return 0
     else:
