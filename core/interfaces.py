@@ -125,6 +125,9 @@ class PipelineContext:
     # Vectors computed for chunks, in the same order.
     vectors: List[List[float]] = field(default_factory=list)
 
+    # The claim this run holds on the document; publishing checks it.
+    processing_token: Optional[str] = None
+
     def with_update(self, **kwargs) -> "PipelineContext":
         """
         Create new context with updated fields (immutable pattern).

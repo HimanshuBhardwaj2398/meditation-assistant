@@ -90,6 +90,8 @@ def print_results(result: dict, verbose: bool = True):
     print(f"Title: {result['title']}")
     print(f"Chunks: {result['chunk_count']}")
     print(f"Status: {'✓ SUCCESS' if result['success'] else '✗ FAILED'}")
+    if result.get("already_completed"):
+        print("Already in the corpus; nothing was processed (use --reprocess to rebuild it).")
 
     # Stage results
     if verbose:

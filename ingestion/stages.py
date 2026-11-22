@@ -12,7 +12,14 @@ from typing import List
 
 from langchain_core.documents import Document as LangchainDocument
 
-from core.exceptions import ChunkingError, DatabaseError, EmbeddingError, ParsingError
+from core.exceptions import (
+    ChunkingError,
+    DatabaseError,
+    DocumentNotFoundError,
+    EmbeddingError,
+    ParsingError,
+    ProcessingLeaseLostError,
+)
 from core.interfaces import PipelineContext, PipelineStage
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.chunking import MarkdownChunker
@@ -246,7 +253,10 @@ class EmbeddingStage(PipelineStage):
             for key in CHUNK_TAG_KEYS:
                 if key in context.source_metadata:
                     metadata.setdefault(key, context.source_metadata[key])
-            chunk_uuid = str(uuid_lib.uuid4())
+            # Keep a chunk's existing UUID (a from_embedding reprocess re-embeds
+            # the stored chunks), so chunk IDs and eval labels keyed on them
+            # survive a re-embed. New chunks get a fresh one.
+            chunk_uuid = metadata.get("uuid") or str(uuid_lib.uuid4())
             metadata["uuid"] = chunk_uuid
             enriched_chunks.append(
                 LangchainDocument(
@@ -364,7 +374,15 @@ class DatabasePersistenceStage(PipelineStage):
 
     async def execute(self, context: PipelineContext) -> PipelineContext:
         """
-        Save document and chunk metadata to database.
+        Publish the document: its vectors, chunk rows, table of contents and
+        COMPLETED status, in one transaction.
+
+        Whatever the document published before (chunk rows and vectors) is
+        deleted in the same transaction, so a reprocess is a replacement: if
+        it fails, the previous version stays searchable.
+
+        The run's claim is checked under a row lock first. A run that another
+        run took over cannot publish.
 
         Args:
             context: Pipeline context with embedded chunks
@@ -374,6 +392,7 @@ class DatabasePersistenceStage(PipelineStage):
 
         Raises:
             DatabaseError: If database operations fail
+            ProcessingLeaseLostError: If this run no longer holds the claim
         """
         from db.crud import ChunkCRUD, DocumentCRUD
         from db.database import session_scope
@@ -391,6 +410,15 @@ class DatabasePersistenceStage(PipelineStage):
             doc_crud = DocumentCRUD(session)
             chunk_crud = ChunkCRUD(session)
 
+            doc = doc_crud.get_document_for_update(context.document_id)
+            if doc is None:
+                raise DocumentNotFoundError(f"Document {context.document_id} not found")
+            if context.processing_token is None or doc.processing_token != context.processing_token:
+                raise ProcessingLeaseLostError(
+                    f"Document {context.document_id}: this run no longer holds its processing "
+                    "claim; another run took it over"
+                )
+
             # Prepare chunk data for database
             chunks_data = []
             for idx, chunk in enumerate(context.chunks):
@@ -407,6 +435,20 @@ class DatabasePersistenceStage(PipelineStage):
                     }
                 )
 
+            # Replace the previous version, if there is one.
+            previous_ids = [row.uuid for row in chunk_crud.get_chunks_by_document(doc.id)]
+            removed_vectors = self.vector_store_manager.delete_document_vectors(
+                session, doc.id, previous_ids
+            )
+            removed_chunks = chunk_crud.delete_chunks_by_document(doc.id)
+            if removed_vectors or removed_chunks:
+                logger.info(
+                    "Replacing document %s: removed %s chunk rows and %s vectors",
+                    doc.id,
+                    removed_chunks,
+                    removed_vectors,
+                )
+
             self.vector_store_manager.stage_vectors(session, context.chunks, context.vectors)
 
             # Save chunks to database
@@ -417,22 +459,23 @@ class DatabasePersistenceStage(PipelineStage):
 
             logger.info(f"Saved {len(created_chunks)} chunks to database")
 
-            # Build and save table of contents from chunk headers
+            # Build the table of contents from chunk headers, replacing any old one
             toc = self._build_table_of_contents(context.chunks)
+            doc_metadata = dict(doc.doc_metadata or {})
             if toc["entries"]:
-                doc_crud.update_doc_metadata(
-                    document_id=context.document_id,
-                    metadata_updates={"table_of_contents": toc},
-                    merge=True,
-                )
+                doc_metadata["table_of_contents"] = toc
                 logger.info(f"Saved table of contents with {len(toc['entries'])} entries")
+            else:
+                doc_metadata.pop("table_of_contents", None)
+            doc_crud.update_doc_metadata(context.document_id, doc_metadata, merge=False)
 
-            # Update document status to COMPLETED
+            # Update document status to COMPLETED and release the claim
             doc_crud.update_status(
                 document_id=context.document_id,
                 status=DocumentStatus.COMPLETED,
                 status_details=f"Successfully processed {len(created_chunks)} chunks",
             )
+            doc.processing_token = None
 
             # Clear temporary chunk storage
             doc_crud.clear_chunks(context.document_id)

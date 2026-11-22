@@ -7,11 +7,8 @@ Handles document ingestion, processing, and orchestration.
 import asyncio
 from typing import Callable, Optional
 
-from core.exceptions import DuplicateDocumentError
 from core.interfaces import StageStatus
-from db.crud import DocumentCRUD
-from db.database import session_scope
-from db.schema import DocumentStatus
+from ingestion.admission import admit
 from ingestion.embed import VectorStoreConfig
 from ingestion.orchestrator import IngestionOrchestrator, IngestionResult
 
@@ -58,24 +55,13 @@ async def ingest_document_async(
         on_stage_update: Optional callback(stage_name, status) for progress updates
 
     Returns:
-        dict: Result from orchestrator with success status and chunk count
+        The orchestrator's result. A source already in the corpus is not
+        processed again: the result has ``already_completed=True`` and the
+        existing document's id. A source that failed before is resumed.
 
     Raises:
-        DuplicateDocumentError: If document with same source already exists
+        DocumentBusyError: Another run is processing the same source
     """
-    # Check for duplicates first
-    with session_scope() as session:
-        crud = DocumentCRUD(session)
-        existing_doc = crud.check_duplicate(source)
-        if existing_doc:
-            raise DuplicateDocumentError(
-                f"Document with source '{source}' already exists "
-                f"(ID: {existing_doc.id}, Title: '{existing_doc.title}', "
-                f"Status: {existing_doc.status.value})"
-            )
-
-    orchestrator = get_orchestrator(collection_name)
-
     # Build metadata
     metadata = {}
     if doc_type:
@@ -90,25 +76,21 @@ async def ingest_document_async(
     if category:
         all_tags.append(f"category:{category}")
 
-    # Create document first with metadata
-    with session_scope() as session:
-        doc = DocumentCRUD(session).create_document(
-            title=title,
-            file_path=source,
-            description=description,
-            doc_metadata=metadata,
-            tags=all_tags,
-            status=DocumentStatus.PENDING,
-        )
-        doc_id = doc.id
+    # Find or create the document; the metadata applies only to a new one.
+    admission = admit(
+        source,
+        title=title,
+        description=description,
+        tags=all_tags,
+        doc_metadata=metadata,
+    )
 
-    # Process through pipeline
-    result = await orchestrator.process(
-        source=doc_id,
+    orchestrator = get_orchestrator(collection_name)
+    return await orchestrator.process(
+        source=admission.document_id,
         title=title,
         on_stage_update=on_stage_update,
     )
-    return result
 
 
 def ingest_document(

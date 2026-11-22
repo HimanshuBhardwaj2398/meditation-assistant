@@ -94,13 +94,30 @@ exception type. `IngestionOrchestrator` then marks the document `FAILED`.
 Stage transitions reach `documents.status` through
 [`StatusRecorder`](../ingestion/status.py).
 
-**Idempotency and resume.** The frozen
-[`PipelineContext`](../core/interfaces.py) carries `stage_results`, so re-runs
-skip finished work. `IngestionOrchestrator.process()` accepts a document ID to
-resume a stuck document, and a `ReprocessMode` (`FULL`, `FROM_CHUNKING`,
-`FROM_EMBEDDING`) that seeds completed stages from stored markdown or chunk
-rows — after first deleting the stale embeddings (by UUID) and chunk rows so
-reprocessing can't leave orphans.
+**Admission, resume and reprocess.** A submitted source goes through
+[`admit()`](../ingestion/admission.py) first. Sources are compared in canonical
+form (`sc:<uid>/<author>`), so a SuttaCentral ref and its reading URL are one
+document. A new source gets a `PENDING` row (one `INSERT ... ON CONFLICT DO
+NOTHING`). A `COMPLETED` one is not processed again: the result reports it with
+`already_completed`. One that never completed is resumed. The frozen
+[`PipelineContext`](../core/interfaces.py) carries `stage_results`, so a resume
+skips parsing when an earlier attempt stored the markdown. A `ReprocessMode`
+(`FULL`, `FROM_CHUNKING`, `FROM_EMBEDDING`) seeds the stages it reuses from
+stored markdown or chunk rows; `FROM_EMBEDDING` keeps the chunks' UUIDs. A
+reprocess is a replacement: the publish transaction deletes the document's old
+chunk rows and vectors (by chunk UUID, and by `cmetadata->>'document_id'` to
+catch vectors older runs left without chunk rows) and writes the new ones. If
+the reprocess fails, the old version stays published and the document returns
+to `COMPLETED`.
+
+**One run per document.** A run claims a document by setting
+`documents.processing_token`, which succeeds only while no run holds a live
+claim. Every status write is fenced by the token and refreshes `updated_at`, so
+a claim lapses only after its run stops writing for `INGESTION_LEASE_SECONDS`
+(default 30 minutes), and another run may then take the document over. The
+publish transaction checks the token under a row lock (`FOR UPDATE`), so a run
+that lost its claim cannot publish. A second run on a busy document gets
+`DocumentBusyError`.
 
 **Status flow.** `DocumentStatus` in [`db/schema.py`](../db/schema.py):
 `PENDING → PARSING → PARSED → CHUNKING → CHUNKED → EMBEDDING → COMPLETED`,

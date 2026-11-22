@@ -6,7 +6,7 @@ faked. The fake vector store writes its rows through the caller's session, so a
 rolled-back publication rolls its vectors back too, as it does on pgvector.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 from sqlalchemy import text
@@ -80,13 +80,34 @@ class SessionVectorStore:
     def __init__(self, db: Database) -> None:
         self.db = db
         self.embedded: List[List[str]] = []
+        # Raise this from the next compute_embeddings call (then clear it).
+        self.fail_next: Optional[Exception] = None
+        # Called at the start of each compute_embeddings, e.g. to simulate
+        # another run acting on the document mid-run.
+        self.before_embedding: Optional[Callable[[], None]] = None
 
     def validate_database(self, session: Any) -> None:
         pass
 
     def compute_embeddings(self, documents: List[Any]) -> List[List[float]]:
+        if self.before_embedding is not None:
+            self.before_embedding()
+        if self.fail_next is not None:
+            error, self.fail_next = self.fail_next, None
+            raise error
         self.embedded.append([doc.page_content for doc in documents])
         return [[float(len(doc.page_content))] for doc in documents]
+
+    def delete_document_vectors(self, session: Any, document_id: int, chunk_ids: List[str]) -> int:
+        deleted = session.execute(
+            text("DELETE FROM fake_vectors WHERE document_id = :document_id"),
+            {"document_id": document_id},
+        ).rowcount
+        for custom_id in chunk_ids:
+            deleted += session.execute(
+                text("DELETE FROM fake_vectors WHERE custom_id = :id"), {"id": custom_id}
+            ).rowcount
+        return deleted
 
     def stage_vectors(self, session: Any, documents: List[Any], vectors: List[Any]) -> None:
         for doc, _vector in zip(documents, vectors, strict=True):

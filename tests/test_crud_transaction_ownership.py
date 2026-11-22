@@ -6,6 +6,7 @@ commit. A CRUD-level commit would make multi-step operations non-atomic:
 an interior commit is durable even if a later step in the same scope fails.
 """
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -32,6 +33,20 @@ MUTATING_OPERATIONS = [
     (
         "update_status",
         lambda s: DocumentCRUD(s).update_status(1, DocumentStatus.COMPLETED, "done"),
+    ),
+    (
+        "insert_if_absent",
+        lambda s: DocumentCRUD(s).insert_if_absent(file_path="src.pdf", title="T"),
+    ),
+    (
+        "claim_for_processing",
+        lambda s: DocumentCRUD(s).claim_for_processing(1, "token", datetime.now(timezone.utc)),
+    ),
+    (
+        "set_status_if_owner",
+        lambda s: DocumentCRUD(s).set_status_if_owner(
+            1, "token", DocumentStatus.PARSING, "running", release=True
+        ),
     ),
     (
         "update_markdown",

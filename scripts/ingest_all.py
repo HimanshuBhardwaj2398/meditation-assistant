@@ -9,7 +9,7 @@ linearly.
 Resumability is keyed on DocumentStatus.COMPLETED, not on row existence:
 ``DocumentCRUD.check_duplicate`` matches on file_path alone, so a document
 that failed mid-pipeline would otherwise be skipped forever. Incomplete rows
-are reprocessed in full instead.
+are resumed: admission maps each source back to its existing document.
 
 Usage:
     poetry run python scripts/ingest_all.py                    # all remaining
@@ -48,16 +48,6 @@ MAX_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (10, 45)
 
 
-def _lookup_document_id(source: str) -> Optional[int]:
-    """Return the document id for ``source``, if a row already exists."""
-    from db.database import session_scope
-    from db.schema import Document
-
-    with session_scope() as session:
-        row = session.query(Document.id).filter(Document.file_path == source).first()
-        return int(row[0]) if row else None
-
-
 def _uid_prefix(uid: str) -> str:
     match = re.match(r"([a-z]+)", uid)
     return match.group(1) if match else ""
@@ -65,6 +55,8 @@ def _uid_prefix(uid: str) -> str:
 
 def load_catalog(include_all_kn: bool = False) -> List[str]:
     """Return `sc:` source strings for every catalogued sutta we want ingested."""
+    from ingestion.admission import canonical_source
+
     sources: List[str] = []
     with CATALOG.open() as handle:
         for line in handle:
@@ -73,7 +65,7 @@ def load_catalog(include_all_kn: bool = False) -> List[str]:
             if nikaya == "kn" and not include_all_kn:
                 if _uid_prefix(entry["uid"]) in EXCLUDED_KN_PREFIXES:
                     continue
-            sources.append(f"sc:{entry['uid']}/{entry['author']}")
+            sources.append(canonical_source(f"sc:{entry['uid']}/{entry['author']}"))
     return sources
 
 
@@ -120,7 +112,7 @@ def _build_orchestrator(neon_url: str):
 
 async def _run_shard(
     worker_id: int,
-    shard: List[Tuple[str, Optional[int]]],
+    shard: List[str],
     neon_url: str,
     progress: Any,
 ) -> Dict[str, Any]:
@@ -130,21 +122,14 @@ async def _run_shard(
     chunks = 0
     failures: List[Dict[str, str]] = []
 
-    for source, existing_id in shard:
+    for source in shard:
         last_error = ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                # A failed attempt still leaves the document row it created, so
-                # re-running process(source) would collide on the unique
-                # file_path index and the retry could never succeed. Re-resolve
-                # the id each attempt and reprocess in place instead.
-                if existing_id is None and attempt > 1:
-                    existing_id = _lookup_document_id(source)
-
-                if existing_id is not None:
-                    result = await orchestrator.process(existing_id, reprocess_mode="full")
-                else:
-                    result = await orchestrator.process(source)
+                # Admission maps the source to its document every attempt: a
+                # row left by a failed attempt is resumed (reusing its stored
+                # markdown), never inserted twice.
+                result = await orchestrator.process(source)
 
                 if not result.get("success"):
                     raise RuntimeError(
@@ -178,7 +163,7 @@ async def _run_shard(
 
 def _worker_entry(
     worker_id: int,
-    shard: List[Tuple[str, Optional[int]]],
+    shard: List[str],
     neon_url: str,
     progress: Any,
     results: Any,
@@ -228,8 +213,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     sources = load_catalog(include_all_kn=args.include_all_kn)
     fresh, stale = partition_worklist(sources)
 
-    worklist: List[Tuple[str, Optional[int]]] = [(s, None) for s in fresh]
-    worklist += [(s, doc_id) for s, doc_id in stale]
+    worklist: List[str] = fresh + [source for source, _ in stale]
 
     if args.limit is not None:
         worklist = worklist[: args.limit]
@@ -246,7 +230,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         return
 
     worker_count = max(1, min(args.workers, len(worklist)))
-    shards: List[List[Tuple[str, Optional[int]]]] = [[] for _ in range(worker_count)]
+    shards: List[List[str]] = [[] for _ in range(worker_count)]
     for index, item in enumerate(worklist):
         shards[index % worker_count].append(item)
 

@@ -7,8 +7,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from db.schema import DocumentStatus
-
 
 @pytest.fixture
 def cli_modules(monkeypatch):
@@ -69,23 +67,44 @@ async def test_cli_display_title_does_not_override_extraction(cli_modules, verbo
 
 
 @pytest.mark.parametrize(
-    "status", [DocumentStatus.COMPLETED, DocumentStatus.FAILED, DocumentStatus.PARSING]
+    ("outcome", "expected_success"),
+    [
+        ({"success": True, "already_completed": True}, True),
+        ({"success": True, "already_completed": False}, True),
+        ({"success": False, "already_completed": False}, False),
+    ],
 )
-async def test_batch_distinguishes_completed_from_incomplete(cli_modules, monkeypatch, status):
+async def test_batch_sends_every_source_through_admission(
+    cli_modules, monkeypatch, outcome, expected_success
+):
+    """Completed sources are skipped and failed ones resume, inside process()."""
     cli = cli_modules.ingest_batch
-    processor = SimpleNamespace(process=AsyncMock())
+    result = {"document_id": 7, "chunk_count": 1, "errors": {}, **outcome}
+    processor = SimpleNamespace(process=AsyncMock(return_value=result))
     monkeypatch.setattr(cli, "IngestionOrchestrator", lambda **kwargs: processor)
-    monkeypatch.setattr(cli, "session_scope", lambda: nullcontext(None))
-    monkeypatch.setattr(
-        cli,
-        "DocumentCRUD",
-        lambda session: SimpleNamespace(
-            check_duplicate=lambda source: SimpleNamespace(id=7, status=status),
-        ),
-    )
+
     success = await cli._ingest_all(["sc:mn1/sujato"], "test", "postgresql://test/test")
-    assert success is (status == DocumentStatus.COMPLETED)
-    processor.process.assert_not_awaited()
+
+    assert success is expected_success
+    processor.process.assert_awaited_once_with("sc:mn1/sujato")
+
+
+async def test_batch_reports_a_busy_source_and_carries_on(cli_modules, monkeypatch):
+    from core.exceptions import DocumentBusyError
+
+    cli = cli_modules.ingest_batch
+    done = {"document_id": 8, "chunk_count": 1, "errors": {}, "success": True}
+    processor = SimpleNamespace(
+        process=AsyncMock(side_effect=[DocumentBusyError("another run"), done])
+    )
+    monkeypatch.setattr(cli, "IngestionOrchestrator", lambda **kwargs: processor)
+
+    success = await cli._ingest_all(
+        ["sc:mn1/sujato", "sc:mn2/sujato"], "test", "postgresql://test/test"
+    )
+
+    assert success is False
+    assert processor.process.await_count == 2
 
 
 @pytest.mark.parametrize("module_name", ["ingest_one", "ingest_batch"])
@@ -118,13 +137,6 @@ def test_single_and_batch_exit_status(cli_modules, monkeypatch, module_name, suc
             ),
         ),
     )
-    if module_name == "ingest_batch":
-        monkeypatch.setattr(cli, "session_scope", lambda: nullcontext(None))
-        monkeypatch.setattr(
-            cli,
-            "DocumentCRUD",
-            lambda session: SimpleNamespace(check_duplicate=lambda source: None),
-        )
 
     if success:
         cli.main(["sc:mn1/sujato"])
@@ -148,7 +160,7 @@ async def test_bulk_failure_keeps_stage_and_error_message(cli_modules, monkeypat
     )
     progress = SimpleNamespace(value=0, get_lock=lambda: nullcontext())
 
-    result = await cli._run_shard(0, [("sc:mn1/sujato", None)], "unused", progress)
+    result = await cli._run_shard(0, ["sc:mn1/sujato"], "unused", progress)
 
     assert result["ingested"] == 0
     assert "embedding: rate limited" in result["failures"][0]["error"]

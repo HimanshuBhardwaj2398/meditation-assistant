@@ -15,6 +15,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_voyageai import VoyageAIEmbeddings
 from psycopg2 import errors as pg_errors
+from sqlalchemy import or_
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
@@ -207,6 +208,27 @@ class VectorStoreManager:
             for doc, vector in zip(documents, vectors, strict=True)
         )
         session.flush()
+
+    def delete_document_vectors(
+        self, session: Session, document_id: int, chunk_ids: List[str]
+    ) -> int:
+        """Delete a document's vectors using the caller's transaction.
+
+        Matches the document's current chunk IDs and also any vector tagged
+        with the document's id. The second catches vectors that earlier
+        versions of the pipeline committed without their chunk rows, which a
+        delete by chunk ID alone never finds. Not limited to one collection:
+        every vector of the document is the document's.
+
+        Returns:
+            How many vector rows were deleted
+        """
+        self.validate_database(session)
+        embedding = self.vector_store.EmbeddingStore
+        match = embedding.cmetadata["document_id"].astext == str(document_id)
+        if chunk_ids:
+            match = or_(match, embedding.custom_id.in_(chunk_ids))
+        return session.query(embedding).filter(match).delete(synchronize_session=False)
 
     def embed_documents(self, documents: List[Document]) -> List[str]:
         """Compute and write vectors for callers without relational chunk persistence."""

@@ -14,7 +14,6 @@ from config.settings import DatabaseSettings, VectorSettings
 from core.exceptions import DocumentNotFoundError, VectorStoreError
 from db.crud import ChunkCRUD, DocumentCRUD, get_all_collections
 from db.database import session_scope
-from db.schema import DocumentStatus
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.orchestrator import IngestionOrchestrator
 
@@ -256,19 +255,16 @@ class CollectionService:
         document_id: int,
     ) -> ReprocessResult:
         """
-        Reprocess a document: delete existing chunks/embeddings and re-ingest.
+        Reprocess a document from its stored markdown: re-chunk and re-embed it.
 
         Useful when:
         - Chunking strategy has changed
         - Embedding model has been updated
         - Document processing failed partway through
 
-        Order of operations:
-        1. Get document info and existing chunk UUIDs
-        2. Delete embeddings from vector store
-        3. Delete chunks from app DB
-        4. Reset document status to PARSED (keeps markdown)
-        5. Run orchestrator to re-chunk and re-embed
+        The run replaces the document in its publish transaction, which deletes
+        the old chunk rows and vectors and writes the new ones together. If the
+        run fails, the old version stays published, and nothing is deleted.
 
         Args:
             document_id: ID of document to reprocess
@@ -278,61 +274,19 @@ class CollectionService:
 
         Raises:
             DocumentNotFoundError: If document doesn't exist
-            CollectionError: If reprocessing fails
         """
-        # Step 1: Get document and chunk UUIDs
         with session_scope() as session:
-            doc_crud = DocumentCRUD(session)
-            chunk_crud = ChunkCRUD(session)
-
-            doc = doc_crud.get_document_by_id(document_id)
+            doc = DocumentCRUD(session).get_document_by_id(document_id)
             if not doc:
                 raise DocumentNotFoundError(f"Document {document_id} not found")
-
-            chunks = chunk_crud.get_chunks_by_document(document_id)
-            chunk_uuids = [c.uuid for c in chunks]
             doc_title = doc.title
-            old_chunk_count = len(chunks)
+            old_chunk_count = len(ChunkCRUD(session).get_chunks_by_document(document_id))
 
         logger.info(
             f"Reprocessing document {document_id} '{doc_title}' "
             f"with {old_chunk_count} existing chunks"
         )
 
-        # Step 2: Delete embeddings from vector store
-        embeddings_deleted = 0
-        if chunk_uuids:
-            try:
-                embeddings_deleted = self.vector_store_manager.delete_by_ids(chunk_uuids)
-                logger.info(f"Deleted {embeddings_deleted} old embeddings")
-            except VectorStoreError as e:
-                logger.error(f"Vector store delete failed: {e}")
-                return ReprocessResult(
-                    document_id=document_id,
-                    title=doc_title,
-                    old_chunks_deleted=0,
-                    old_embeddings_deleted=0,
-                    new_chunks_created=0,
-                    success=False,
-                    error=f"Failed to delete old embeddings: {e}",
-                )
-
-        # Step 3: Delete chunks from app DB and reset status
-        with session_scope() as session:
-            chunk_crud = ChunkCRUD(session)
-            doc_crud = DocumentCRUD(session)
-
-            chunks_deleted = chunk_crud.delete_chunks_by_document(document_id)
-            logger.info(f"Deleted {chunks_deleted} chunks from app DB")
-
-            # Reset status to PARSED so orchestrator will re-chunk and re-embed
-            doc_crud.update_status(
-                document_id,
-                DocumentStatus.PARSED,
-                status_details="Reprocessing: chunks cleared, ready for re-chunking",
-            )
-
-        # Step 4: Run orchestrator to re-process
         try:
             orchestrator = IngestionOrchestrator(
                 vector_store_config=VectorStoreConfig(
@@ -363,11 +317,13 @@ class CollectionService:
                 )
                 logger.error("Reprocessing failed for document %s: %s", document_id, error)
 
+            # Old chunks and their vectors are replaced only when the run publishes.
+            replaced = old_chunk_count if success else 0
             return ReprocessResult(
                 document_id=document_id,
                 title=doc_title,
-                old_chunks_deleted=old_chunk_count,
-                old_embeddings_deleted=embeddings_deleted,
+                old_chunks_deleted=replaced,
+                old_embeddings_deleted=replaced,
                 new_chunks_created=new_chunk_count,
                 success=success,
                 error=error,
@@ -378,8 +334,8 @@ class CollectionService:
             return ReprocessResult(
                 document_id=document_id,
                 title=doc_title,
-                old_chunks_deleted=old_chunk_count,
-                old_embeddings_deleted=embeddings_deleted,
+                old_chunks_deleted=0,
+                old_embeddings_deleted=0,
                 new_chunks_created=0,
                 success=False,
                 error=f"Reprocessing failed: {e}",

@@ -148,6 +148,26 @@ class ChunkingSettings(BaseSettings):
             )
 
 
+class IngestionSettings(BaseSettings):
+    """Ingestion pipeline configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="INGESTION_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    lease_seconds: int = Field(
+        default=1800,
+        gt=0,
+        description=(
+            "How long a run's claim on a document survives without a status write "
+            "before another run may take the document over"
+        ),
+    )
+
+
 class LangfuseSettings(BaseSettings):
     """Langfuse tracing configuration."""
 
@@ -285,6 +305,7 @@ class Settings(BaseSettings):
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     parsing: ParsingSettings = Field(default_factory=ParsingSettings)
     chunking: ChunkingSettings = Field(default_factory=ChunkingSettings)
+    ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     vector: VectorSettings = Field(default_factory=VectorSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)

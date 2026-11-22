@@ -146,16 +146,16 @@ async def test_reprocess_full_parses_again(orchestrator, ingest_db, parser, vect
     assert_published_in_step(state, vectors, document_id)
 
 
-async def test_status_trail_for_a_new_source(orchestrator, monkeypatch):
-    """Every status written to documents.status during one clean run, in order."""
+async def test_status_trail_for_a_new_source(orchestrator, ingest_db, monkeypatch):
+    """Every progress status a clean run writes, in order, then COMPLETED with the claim released."""
     trail = []
-    original = DocumentCRUD.update_status
+    original = DocumentCRUD.set_status_if_owner
 
-    def recording(self, document_id, status, status_details=None):
+    def recording(self, document_id, token, status, status_details=None, release=False):
         trail.append(status)
-        return original(self, document_id, status, status_details)
+        return original(self, document_id, token, status, status_details, release)
 
-    monkeypatch.setattr(DocumentCRUD, "update_status", recording)
+    monkeypatch.setattr(DocumentCRUD, "set_status_if_owner", recording)
 
     result = await orchestrator.process(SOURCE)
 
@@ -168,5 +168,8 @@ async def test_status_trail_for_a_new_source(orchestrator, monkeypatch):
         DocumentStatus.EMBEDDING,
         DocumentStatus.EMBEDDING,
         DocumentStatus.EMBEDDING,
-        DocumentStatus.COMPLETED,
     ]
+    with ingest_db.session_scope() as session:
+        doc = session.get(Document, result["document_id"])
+        assert doc.status == DocumentStatus.COMPLETED
+        assert doc.processing_token is None

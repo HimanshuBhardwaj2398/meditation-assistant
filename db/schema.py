@@ -69,6 +69,14 @@ class Document(Base):
         nullable=True,
         comment="Error messages or status information from pipeline stages",
     )
+    processing_token = Column(
+        Text,
+        nullable=True,
+        comment=(
+            "Claim held by the ingestion run processing this document; NULL when idle. "
+            "Every status write refreshes updated_at, which is the claim's heartbeat."
+        ),
+    )
 
     # Temporary Chunk Storage (cleared after successful embedding)
     chunks = Column(

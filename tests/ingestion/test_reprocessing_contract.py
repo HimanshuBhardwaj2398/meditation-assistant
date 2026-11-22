@@ -8,6 +8,7 @@ import pytest
 from langchain.schema import Document
 
 from core.interfaces import ParseResult, PipelineContext, StageStatus
+from db.schema import DocumentStatus
 from ingestion.embed import VectorStoreConfig
 from ingestion.orchestrator import IngestionOrchestrator
 from ingestion.stages import ParsingStage
@@ -33,6 +34,7 @@ async def test_reprocessing_preserves_source_metadata_in_vectors(monkeypatch, mo
         file_path="sc:mn1/sujato",
         doc_metadata={**metadata, "table_of_contents": {"entries": []}},
         chunks=None,
+        status=DocumentStatus.COMPLETED,
     )
     document_crud = MagicMock()
     document_crud.get_document_by_id.return_value = doc
