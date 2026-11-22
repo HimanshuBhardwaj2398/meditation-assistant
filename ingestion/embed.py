@@ -18,6 +18,7 @@ from psycopg2 import errors as pg_errors
 from sqlalchemy import or_
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import NullPool
 
 from core.exceptions import DatabaseConnectionError, EmbeddingError, VectorStoreError
 
@@ -129,13 +130,18 @@ class VectorStoreManager:
             DatabaseConnectionError: If connection to database fails.
         """
         try:
-            # Use correct API for langchain_community.vectorstores.pgvector.PGVector
-            # Note: First two args are positional: connection_string, embedding_function
+            # PGVector creates its tables and this collection when built, on an
+            # engine of its own. Vector writes and deletes go through the app's
+            # session, so that engine is only needed here: NullPool closes its
+            # connection afterwards instead of keeping one open on Neon. The
+            # pgvector extension is the migrations' job (alembic / init_db).
             vector_store = PGVector(
                 connection_string=self.config.db_url,
                 embedding_function=self.embeddings,
                 collection_name=self.config.collection_name,
                 use_jsonb=self.config.use_jsonb,
+                create_extension=False,
+                engine_args={"poolclass": NullPool},
             )
 
             logger.info(f"Connected to vector store collection: {self.config.collection_name}")

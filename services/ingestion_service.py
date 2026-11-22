@@ -5,6 +5,7 @@ Handles document ingestion, processing, and orchestration.
 """
 
 import asyncio
+from functools import lru_cache
 from typing import Callable, Optional
 
 from core.interfaces import StageStatus
@@ -12,8 +13,14 @@ from ingestion.embed import VectorStoreConfig
 from ingestion.orchestrator import IngestionOrchestrator, IngestionResult
 
 
+@lru_cache(maxsize=None)
 def get_orchestrator(collection_name: Optional[str] = None) -> IngestionOrchestrator:
-    """Initialize ingestion orchestrator with vector store config.
+    """The process's ingestion orchestrator for a collection.
+
+    Cached, so the vector store (its tables, its collection row, its engine)
+    is set up once per process rather than on every ingest. The orchestrator
+    keeps no per-document state between runs. Tests that change settings call
+    ``get_orchestrator.cache_clear()``.
 
     Args:
         collection_name: Name of the collection to store embeddings in;

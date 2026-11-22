@@ -22,8 +22,10 @@ def hermetic_settings(monkeypatch, tmp_path):
     """
     monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
+    get_orchestrator.cache_clear()
     yield
     get_settings.cache_clear()
+    get_orchestrator.cache_clear()
 
 
 def test_vector_store_config_falls_back_to_settings_url(monkeypatch, hermetic_settings):

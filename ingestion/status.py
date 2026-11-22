@@ -8,6 +8,13 @@ COMPLETED.
 Every write is fenced by the run's claim token: it lands only while this run
 still holds the document. The same write refreshes ``updated_at``, which is
 what keeps the claim alive.
+
+Each write is a Neon round trip or three, so only real changes are written:
+the status a stage starts under, and only when it differs from the current
+one. A stage finishing writes nothing (the next stage starting overwrites it a
+moment later), and the claim already set the run's starting status. A clean
+run writes CHUNKING and EMBEDDING here; the claim wrote PARSING before it, and
+publishing writes COMPLETED.
 """
 
 import logging
@@ -27,41 +34,44 @@ RUNNING_STATUS: Dict[str, DocumentStatus] = {
     "database_persistence": DocumentStatus.EMBEDDING,
 }
 
-COMPLETED_STATUS: Dict[str, DocumentStatus] = {
-    "parsing": DocumentStatus.PARSED,
-    "chunking": DocumentStatus.CHUNKED,
-    # Keep EMBEDDING until database persistence marks COMPLETED.
-    "embedding": DocumentStatus.EMBEDDING,
-}
-
 
 class StatusRecorder:
     """Writes one run's progress on one document, while the run holds its claim."""
 
-    def __init__(self, document_id: int, token: str, *, replacing: bool = False) -> None:
+    def __init__(
+        self,
+        document_id: int,
+        token: str,
+        *,
+        replacing: bool = False,
+        current: Optional[DocumentStatus] = None,
+    ) -> None:
         """
         Args:
             document_id: The document this run is processing
             token: The run's processing claim
             replacing: The document was COMPLETED when the run started, so a
                 failure leaves the previous version published
+            current: The status the document has now (the one the claim set)
         """
         self.document_id = document_id
         self.token = token
         self.replacing = replacing
+        self.current = current
 
     def record(self, stage_name: str, stage_status: StageStatus) -> None:
         """Mirror one stage transition.
 
-        A failed stage writes nothing here; ``finish_failed`` writes the run's
-        final state once. A database error is logged and the run goes on.
+        Only a stage starting under a new status writes. A failed stage writes
+        nothing here; ``finish_failed`` writes the run's final state once. A
+        database error is logged and the run goes on.
 
         Raises:
             ProcessingLeaseLostError: Another run has taken the document over,
                 so this one must stop.
         """
         status = self._map(stage_name, stage_status)
-        if status is None:
+        if status is None or status == self.current:
             return
         try:
             owned = self._write(status, f"Stage '{stage_name}' {stage_status.value}")
@@ -78,6 +88,7 @@ class StatusRecorder:
             raise ProcessingLeaseLostError(
                 f"Document {self.document_id}: another run took over its processing claim"
             )
+        self.current = status
         logger.info(
             "Document %s status -> %s (%s: %s)",
             self.document_id,
@@ -109,8 +120,6 @@ class StatusRecorder:
     def _map(stage_name: str, stage_status: StageStatus) -> Optional[DocumentStatus]:
         if stage_status == StageStatus.RUNNING:
             return RUNNING_STATUS.get(stage_name)
-        if stage_status == StageStatus.COMPLETED:
-            return COMPLETED_STATUS.get(stage_name)
         return None
 
     def _write(self, status: DocumentStatus, details: str, release: bool = False) -> bool:

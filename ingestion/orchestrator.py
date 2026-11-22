@@ -35,7 +35,7 @@ from ingestion.stages import (
     ParsingStage,
     source_provenance,
 )
-from ingestion.status import StatusRecorder
+from ingestion.status import RUNNING_STATUS, StatusRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +260,8 @@ class _PreparedRun:
     source_metadata: Dict[str, Any] = field(default_factory=dict)
     # The document's own vector collection; publishing writes there.
     vector_collection: Optional[str] = None
+    # The status the claim set as the run started.
+    start_status: Optional[Any] = None
 
 
 class IngestionOrchestrator:
@@ -459,13 +461,6 @@ class IngestionOrchestrator:
             if was_completed and mode is None:
                 return None
 
-            if not crud.claim_for_processing(document_id, token, stale_before):
-                raise DocumentBusyError(
-                    f"Document {document_id} is being processed by another run; "
-                    f"try again once it finishes (a dead run's claim lapses after "
-                    f"{self.lease_seconds}s)"
-                )
-
             run = _PreparedRun(
                 document_id=doc.id,
                 source=doc.file_path,
@@ -474,6 +469,24 @@ class IngestionOrchestrator:
                 replacing=was_completed,
             )
             self._seed(run, doc, ChunkCRUD(session), mode)
+
+            # The claim also sets the status of the first stage that will run,
+            # saving that stage a status write of its own.
+            first_stage = next(name for name in RUNNING_STATUS if name not in run.stage_results)
+            run.start_status = RUNNING_STATUS[first_stage]
+            if not crud.claim_for_processing(
+                document_id,
+                token,
+                stale_before,
+                status=run.start_status,
+                status_details=f"Stage '{first_stage}' running",
+            ):
+                raise DocumentBusyError(
+                    f"Document {document_id} is being processed by another run; "
+                    f"try again once it finishes (a dead run's claim lapses after "
+                    f"{self.lease_seconds}s)"
+                )
+
             if self.enable_database_persistence:
                 run.vector_collection = self._resolve_collection(session, doc)
             if clear_markdown:
@@ -607,7 +620,9 @@ class IngestionOrchestrator:
         on_stage_update: Optional[Callable[[str, StageStatus], None]],
     ) -> IngestionResult:
         """Run the stages on a claimed document and report the outcome."""
-        recorder = StatusRecorder(run.document_id, run.token, replacing=run.replacing)
+        recorder = StatusRecorder(
+            run.document_id, run.token, replacing=run.replacing, current=run.start_status
+        )
 
         def _on_stage_update(stage_name: str, stage_status: StageStatus) -> None:
             recorder.record(stage_name, stage_status)

@@ -147,29 +147,53 @@ async def test_reprocess_full_parses_again(orchestrator, ingest_db, parser, vect
 
 
 async def test_status_trail_for_a_new_source(orchestrator, ingest_db, monkeypatch):
-    """Every progress status a clean run writes, in order, then COMPLETED with the claim released."""
+    """Only real status changes are written: one per stage that changes it.
+
+    The claim sets PARSING, the recorder writes CHUNKING and EMBEDDING
+    (persistence also reports under EMBEDDING, so it writes nothing), and
+    publishing sets COMPLETED. Each write is a database round trip.
+    """
     trail = []
-    original = DocumentCRUD.set_status_if_owner
+    claim = DocumentCRUD.claim_for_processing
+    write = DocumentCRUD.set_status_if_owner
 
-    def recording(self, document_id, token, status, status_details=None, release=False):
-        trail.append(status)
-        return original(self, document_id, token, status, status_details, release)
+    def recording_claim(self, document_id, token, stale_before, status=None, status_details=None):
+        trail.append(("claim", status))
+        return claim(self, document_id, token, stale_before, status, status_details)
 
-    monkeypatch.setattr(DocumentCRUD, "set_status_if_owner", recording)
+    def recording_write(self, document_id, token, status, status_details=None, release=False):
+        trail.append(("write", status))
+        return write(self, document_id, token, status, status_details, release)
+
+    monkeypatch.setattr(DocumentCRUD, "claim_for_processing", recording_claim)
+    monkeypatch.setattr(DocumentCRUD, "set_status_if_owner", recording_write)
 
     result = await orchestrator.process(SOURCE)
 
     assert result["success"] is True, result["errors"]
     assert trail == [
-        DocumentStatus.PARSING,
-        DocumentStatus.PARSED,
-        DocumentStatus.CHUNKING,
-        DocumentStatus.CHUNKED,
-        DocumentStatus.EMBEDDING,
-        DocumentStatus.EMBEDDING,
-        DocumentStatus.EMBEDDING,
+        ("claim", DocumentStatus.PARSING),
+        ("write", DocumentStatus.CHUNKING),
+        ("write", DocumentStatus.EMBEDDING),
     ]
     with ingest_db.session_scope() as session:
         doc = session.get(Document, result["document_id"])
         assert doc.status == DocumentStatus.COMPLETED
         assert doc.processing_token is None
+
+
+async def test_a_reprocess_starts_at_the_stage_it_runs_first(orchestrator, ingest_db, monkeypatch):
+    first = await orchestrator.process(SOURCE)
+    statuses = []
+    claim = DocumentCRUD.claim_for_processing
+
+    def recording_claim(self, document_id, token, stale_before, status=None, status_details=None):
+        statuses.append(status)
+        return claim(self, document_id, token, stale_before, status, status_details)
+
+    monkeypatch.setattr(DocumentCRUD, "claim_for_processing", recording_claim)
+
+    await orchestrator.process(first["document_id"], reprocess_mode="from_chunking")
+    await orchestrator.process(first["document_id"], reprocess_mode="from_embedding")
+
+    assert statuses == [DocumentStatus.CHUNKING, DocumentStatus.EMBEDDING]

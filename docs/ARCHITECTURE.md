@@ -92,7 +92,9 @@ orchestrator is the one place that records the failure, keeping a
 `MeditationDBError`'s message as-is and prefixing anything else with its
 exception type. `IngestionOrchestrator` then marks the document `FAILED`.
 Stage transitions reach `documents.status` through
-[`StatusRecorder`](../ingestion/status.py).
+[`StatusRecorder`](../ingestion/status.py), which writes only real changes (each
+write is a round trip to Neon): a clean run shows PARSING (set by the claim),
+CHUNKING, EMBEDDING, then COMPLETED.
 
 **Admission, resume and reprocess.** A submitted source goes through
 [`admit()`](../ingestion/admission.py) first. Sources are compared in canonical

@@ -153,13 +153,23 @@ class DocumentCRUD:
         )
         return self.db.execute(statement).scalar_one_or_none()
 
-    def claim_for_processing(self, document_id: int, token: str, stale_before: datetime) -> bool:
+    def claim_for_processing(
+        self,
+        document_id: int,
+        token: str,
+        stale_before: datetime,
+        status: Optional[schema.DocumentStatus] = None,
+        status_details: Optional[str] = None,
+    ) -> bool:
         """
         Take a document's processing claim if no live run holds it.
 
         A claim is live while processing_token is set and the row was written
         after stale_before. Each status write by the owning run refreshes
         updated_at, so a claim lapses only once its run stops writing.
+
+        Args:
+            status: Also set the run's starting status, in the same UPDATE
 
         Returns:
             True if this call took the claim
@@ -177,6 +187,14 @@ class DocumentCRUD:
                 {
                     schema.Document.processing_token: token,
                     schema.Document.updated_at: func.now(),
+                    **(
+                        {
+                            schema.Document.status: status,
+                            schema.Document.status_details: status_details,
+                        }
+                        if status is not None
+                        else {}
+                    ),
                 },
                 synchronize_session=False,
             )
