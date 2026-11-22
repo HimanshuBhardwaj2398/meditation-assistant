@@ -16,7 +16,13 @@ from core.interfaces import PipelineContext, PipelineStage, StageStatus
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.parsing import ParserFactory
-from ingestion.stages import ChunkingStage, DatabasePersistenceStage, EmbeddingStage, ParsingStage
+from ingestion.stages import (
+    ChunkingStage,
+    DatabasePersistenceStage,
+    EmbeddingStage,
+    ParsingStage,
+    source_provenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,11 +296,14 @@ class IngestionOrchestrator:
         seeded_parsed_content: Optional[str] = None
         seeded_chunks: List[LangchainDocument] = []
         seeded_stage_results: Dict[str, StageStatus] = {}
+        seeded_source_metadata: Dict[str, Any] = {}
 
         if isinstance(source, int):
             # Resume existing document
             chunk_uuids: List[str] = []
             with session_scope() as session:
+                if self.enable_database_persistence:
+                    self.vector_store_manager.validate_database(session)
                 doc_crud = DocumentCRUD(session)
                 chunk_crud = ChunkCRUD(session)
 
@@ -303,7 +312,11 @@ class IngestionOrchestrator:
                     raise DocumentNotFoundError(f"Document {source} not found")
 
                 source = doc.file_path
-                title = title or doc.title
+                if mode in (ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING):
+                    title = title or doc.title
+                    seeded_source_metadata = source_provenance(doc.doc_metadata or {})
+                elif doc.title != "Untitled":
+                    title = title or doc.title
                 document_id = doc.id
                 existing_markdown = doc.markdown
                 existing_doc_metadata = dict(doc.doc_metadata or {})
@@ -399,6 +412,8 @@ class IngestionOrchestrator:
                 )
             # Create new document
             with session_scope() as session:
+                if self.enable_database_persistence:
+                    self.vector_store_manager.validate_database(session)
                 doc = DocumentCRUD(session).create_document(
                     title=title or "Untitled",
                     file_path=source,
@@ -469,12 +484,14 @@ class IngestionOrchestrator:
         stages = [
             ParsingStage(self.parser_factory),
             ChunkingStage(self.chunking_config),
-            EmbeddingStage(self.vector_store_manager),
+            EmbeddingStage(
+                self.vector_store_manager, vector_only=not self.enable_database_persistence
+            ),
         ]
 
         # Add database persistence stage if enabled
         if self.enable_database_persistence:
-            stages.append(DatabasePersistenceStage())
+            stages.append(DatabasePersistenceStage(self.vector_store_manager))
 
         # Create orchestrator
         pipeline = PipelineOrchestrator(stages)
@@ -487,6 +504,7 @@ class IngestionOrchestrator:
             parsed_content=seeded_parsed_content,
             chunks=seeded_chunks,
             stage_results=seeded_stage_results,
+            source_metadata=seeded_source_metadata,
         )
 
         try:

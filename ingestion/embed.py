@@ -8,12 +8,15 @@ and managing the connection to PostgreSQL with pgvector extension.
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_voyageai import VoyageAIEmbeddings
 from psycopg2 import errors as pg_errors
+from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 
 from core.exceptions import DatabaseConnectionError, EmbeddingError, VectorStoreError
 
@@ -121,72 +124,77 @@ class VectorStoreManager:
             logger.error(error_msg)
             raise DatabaseConnectionError(error_msg) from e
 
-    def embed_documents(self, documents: List[Document]) -> List[str]:
-        """
-        Embed and store documents in the vector store.
+    def compute_embeddings(self, documents: List[Document]) -> List[List[float]]:
+        """Compute vectors in input order without writing any database rows."""
+        if self.config.batch_size < 1:
+            raise EmbeddingError("Embedding batch size must be positive")
 
-        Args:
-            documents: List of documents to embed and store.
-
-        Returns:
-            List of document IDs that were successfully stored.
-
-        Raises:
-            EmbeddingError: If document embedding or storage fails.
-        """
-        if not documents:
-            logger.warning("No documents provided for embedding")
-            return []
-
-        try:
-            return self._embed_documents_batch(documents)
-        except EmbeddingError:
-            raise
-        except Exception as e:
-            raise EmbeddingError(f"Failed to embed documents: {e}") from e
-
-    def _embed_documents_batch(self, documents: List[Document]) -> List[str]:
-        """
-        Embed documents in batches for better performance and error handling.
-
-        Args:
-            documents: List of documents to process.
-
-        Returns:
-            List of all document IDs that were successfully stored.
-        """
-        all_ids = []
-        total_docs = len(documents)
-
-        logger.info(f"Processing {total_docs} documents in batches of {self.config.batch_size}")
-
-        for i in range(0, total_docs, self.config.batch_size):
-            batch = documents[i : i + self.config.batch_size]
-            batch_num = (i // self.config.batch_size) + 1
-            total_batches = (total_docs + self.config.batch_size - 1) // self.config.batch_size
-
-            logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} documents)")
-
+        vectors: List[List[float]] = []
+        for start in range(0, len(documents), self.config.batch_size):
+            batch = documents[start : start + self.config.batch_size]
+            batch_number = start // self.config.batch_size + 1
             try:
-                batch_ids = self.vector_store.add_documents(batch)
-                if len(batch_ids) != len(batch):
-                    raise EmbeddingError(
-                        f"Batch {batch_num}/{total_batches} returned {len(batch_ids)} "
-                        f"IDs for {len(batch)} documents"
-                    )
-                all_ids.extend(batch_ids)
-                logger.info(
-                    f"Successfully processed batch {batch_num} - {len(batch_ids)} documents stored"
+                batch_vectors = self.embeddings.embed_documents([doc.page_content for doc in batch])
+            except Exception as exc:
+                raise EmbeddingError(f"Embedding batch {batch_number} failed: {exc}") from exc
+            if len(batch_vectors) != len(batch):
+                raise EmbeddingError(
+                    f"Embedding batch {batch_number} returned {len(batch_vectors)} vectors "
+                    f"for {len(batch)} chunks"
                 )
+            vectors.extend(batch_vectors)
+        return vectors
 
-            except Exception as e:
-                logger.error(f"Failed to process batch {batch_num}: {e}")
-                raise EmbeddingError(f"Batch {batch_num}/{total_batches} failed: {e}") from e
+    def validate_database(self, session: Session) -> None:
+        """Require one database target for document and vector persistence."""
+        db_url = self.config.db_url
+        if not db_url or session.get_bind().engine.url != make_url(db_url):
+            raise VectorStoreError("Document and vector writes must use the same database URL")
 
-        logger.info(
-            f"Completed processing: {len(all_ids)}/{total_docs} documents successfully stored"
+    def stage_vectors(
+        self, session: Session, documents: List[Document], vectors: List[List[float]]
+    ) -> None:
+        """Flush vector rows using the caller's transaction."""
+        self.validate_database(session)
+        ids = {doc.id for doc in documents}
+        if None in ids or "" in ids or len(ids) != len(documents):
+            raise VectorStoreError("Each vector must have a unique chunk ID")
+        if not documents or len(documents) != len(vectors):
+            raise VectorStoreError("A vector is required for each chunk")
+
+        # The legacy store initializes its schema/collection independently. Its
+        # models can then use the application's session for all document data.
+        store = self.vector_store
+        collection = store.get_collection(session)
+        if collection is None:
+            raise VectorStoreError(f"Vector collection {self.config.collection_name!r} not found")
+        session.add_all(
+            store.EmbeddingStore(
+                document=doc.page_content,
+                embedding=vector,
+                cmetadata=doc.metadata,
+                custom_id=doc.id,
+                collection_id=collection.uuid,
+            )
+            for doc, vector in zip(documents, vectors, strict=True)
         )
-        return all_ids
+        session.flush()
+
+    def embed_documents(self, documents: List[Document]) -> List[str]:
+        """Compute and write vectors for callers without relational chunk persistence."""
+        if not documents:
+            return []
+        vectors = self.compute_embeddings(documents)
+        ids = [doc.id or str(uuid4()) for doc in documents]
+        try:
+            return self.vector_store.add_embeddings(
+                texts=[doc.page_content for doc in documents],
+                embeddings=vectors,
+                metadatas=[doc.metadata for doc in documents],
+                ids=ids,
+            )
+        except Exception as exc:
+            raise EmbeddingError(f"Failed to store embeddings: {exc}") from exc
 
     def get_collection_info(self) -> Dict[str, Any]:
         """

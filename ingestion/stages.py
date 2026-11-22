@@ -1,7 +1,7 @@
 """
 Pipeline stages for document ingestion.
 
-Each stage is idempotent and declares its dependencies.
+Each stage declares its dependencies.
 Stages receive a PipelineContext and return an updated context.
 """
 
@@ -11,7 +11,13 @@ from typing import List
 
 from langchain.schema import Document as LangchainDocument
 
-from core.exceptions import ChunkingError, DatabaseError, EmbeddingError, ParsingError
+from core.exceptions import (
+    ChunkingError,
+    DatabaseError,
+    EmbeddingError,
+    ParsingError,
+    VectorStoreError,
+)
 from core.interfaces import PipelineContext, PipelineStage
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.chunking import MarkdownChunker
@@ -19,6 +25,21 @@ from ingestion.embed import VectorStoreManager
 from ingestion.parsing import ParserFactory
 
 logger = logging.getLogger(__name__)
+
+
+def source_provenance(metadata: dict) -> dict:
+    """Source fields shared by freshly parsed and reprocessed documents."""
+    keys = (
+        "source",
+        "uid",
+        "author_uid",
+        "lang",
+        "nikaya",
+        "nikaya_name",
+        "nikaya_english",
+        "reading_url",
+    )
+    return {key: metadata[key] for key in keys if key in metadata}
 
 
 # ============================================================================
@@ -80,21 +101,9 @@ class ParsingStage(PipelineStage):
             logger.info(f"Successfully parsed: {context.source} (title: {result.title})")
 
             metadata = result.metadata or {}
+            title = context.title or result.title or "Untitled"
             tags = metadata.get("tags")
-            structured = {
-                key: metadata[key]
-                for key in (
-                    "source",
-                    "uid",
-                    "author_uid",
-                    "lang",
-                    "nikaya",
-                    "nikaya_name",
-                    "nikaya_english",
-                    "reading_url",
-                )
-                if key in metadata
-            }
+            structured = source_provenance(metadata)
 
             # Persist markdown, the parsed title, and source tags/metadata
             if context.document_id:
@@ -102,8 +111,7 @@ class ParsingStage(PipelineStage):
                     doc = DocumentCRUD(session).get_document_by_id(context.document_id)
                     if doc:
                         doc.markdown = result.content
-                        if result.title:
-                            doc.title = result.title
+                        doc.title = title
                         if tags:
                             existing = list(doc.tags or [])
                             doc.tags = existing + [t for t in tags if t not in existing]
@@ -116,7 +124,7 @@ class ParsingStage(PipelineStage):
             # Update context with parsed results (source_metadata tags the chunks later)
             return context.with_update(
                 parsed_content=result.content,
-                title=result.title or "Untitled",
+                title=title,
                 source_metadata=metadata,
             ).mark_stage_completed(self.name)
 
@@ -206,21 +214,16 @@ class ChunkingStage(PipelineStage):
 
 class EmbeddingStage(PipelineStage):
     """
-    Stage 3: Embed chunks and store in vector database.
+    Stage 3: Compute vectors for chunks.
 
     Dependencies: chunking
     Input: context.chunks, context.document_id, context.title
-    Output: Chunks stored in vector database
+    Output: Chunks with UUIDs and vectors ready for persistence
     """
 
-    def __init__(self, vector_store_manager: VectorStoreManager):
-        """
-        Initialize embedding stage.
-
-        Args:
-            vector_store_manager: Manager for vector store operations
-        """
+    def __init__(self, vector_store_manager: VectorStoreManager, *, vector_only: bool = False):
         self.vector_store_manager = vector_store_manager
+        self.vector_only = vector_only
 
     @property
     def name(self) -> str:
@@ -232,7 +235,7 @@ class EmbeddingStage(PipelineStage):
 
     async def execute(self, context: PipelineContext) -> PipelineContext:
         """
-        Embed chunks and store in vector database.
+        Compute vectors and attach the chunk IDs used by both tables.
 
         Args:
             context: Pipeline context with chunks
@@ -252,7 +255,6 @@ class EmbeddingStage(PipelineStage):
             # Enrich copies, not the shared chunk objects — the input context
             # must stay unchanged (PipelineContext immutability is shallow).
             enriched_chunks: List[LangchainDocument] = []
-            expected_ids = []
             for chunk in context.chunks:
                 metadata = dict(chunk.metadata)
                 if context.document_id is not None:
@@ -274,29 +276,20 @@ class EmbeddingStage(PipelineStage):
                         metadata=metadata,
                     )
                 )
-                expected_ids.append(chunk_uuid)
 
-            # Embed and store in vector database
-            vector_ids = self.vector_store_manager.embed_documents(enriched_chunks)
+            if self.vector_only:
+                vector_ids = self.vector_store_manager.embed_documents(enriched_chunks)
+                expected_ids = {chunk.id for chunk in enriched_chunks}
+                if len(vector_ids) != len(enriched_chunks) or set(vector_ids) != expected_ids:
+                    raise EmbeddingError("Stored vector IDs do not match the chunk IDs")
+                vectors = []
+            else:
+                vectors = self.vector_store_manager.compute_embeddings(enriched_chunks)
 
-            if len(vector_ids) != len(enriched_chunks):
-                raise EmbeddingError(
-                    f"Embedding mismatch: {len(enriched_chunks)} chunks, "
-                    f"{len(vector_ids)} embeddings stored"
-                )
-
-            if set(vector_ids) != set(expected_ids):
-                missing_ids = sorted(set(expected_ids) - set(vector_ids))
-                extra_ids = sorted(set(vector_ids) - set(expected_ids))
-                raise EmbeddingError(
-                    "Embedding ID mismatch. "
-                    f"Missing IDs: {missing_ids[:3]} "
-                    f"Extra IDs: {extra_ids[:3]}"
-                )
-
-            logger.info(f"Successfully embedded {len(vector_ids)} chunks")
-
-            return context.with_update(chunks=enriched_chunks).mark_stage_completed(self.name)
+            logger.info("Successfully embedded %s chunks", len(enriched_chunks))
+            return context.with_update(
+                chunks=enriched_chunks, vectors=vectors
+            ).mark_stage_completed(self.name)
 
         except EmbeddingError as e:
             logger.error(f"Embedding failed: {e}")
@@ -313,12 +306,15 @@ class EmbeddingStage(PipelineStage):
 
 class DatabasePersistenceStage(PipelineStage):
     """
-    Stage 4: Save document and chunk metadata to database.
+    Stage 4: Publish vectors and relational metadata together.
 
     Dependencies: embedding
-    Input: context.document_id, context.chunks (with UUIDs from vector store)
+    Input: context.document_id, context.chunks, context.vectors
     Output: Chunks saved to database, document status updated to COMPLETED
     """
+
+    def __init__(self, vector_store_manager: VectorStoreManager):
+        self.vector_store_manager = vector_store_manager
 
     @property
     def name(self) -> str:
@@ -414,8 +410,7 @@ class DatabasePersistenceStage(PipelineStage):
             raise DatabaseError("No document_id in context")
 
         if not context.chunks:
-            logger.warning("No chunks to persist")
-            return context.mark_stage_completed(self.name)
+            raise DatabaseError("No chunks to persist")
 
         logger.info(f"Persisting {len(context.chunks)} chunks to database")
 
@@ -427,12 +422,9 @@ class DatabasePersistenceStage(PipelineStage):
                 # Prepare chunk data for database
                 chunks_data = []
                 for idx, chunk in enumerate(context.chunks):
-                    # Extract UUID from metadata (added by EmbeddingStage)
-                    chunk_uuid = chunk.metadata.get("uuid")
-                    if not chunk_uuid:
-                        # Generate UUID if not present (shouldn't happen)
-                        chunk_uuid = str(uuid_lib.uuid4())
-                        logger.warning(f"Chunk {idx} missing UUID, generated: {chunk_uuid}")
+                    chunk_uuid = chunk.id
+                    if not chunk_uuid or chunk.metadata.get("uuid") != chunk_uuid:
+                        raise DatabaseError(f"Chunk {idx} has a missing or inconsistent UUID")
 
                     chunks_data.append(
                         {
@@ -444,6 +436,8 @@ class DatabasePersistenceStage(PipelineStage):
                             },
                         }
                     )
+
+                self.vector_store_manager.stage_vectors(session, context.chunks, context.vectors)
 
                 # Save chunks to database
                 created_chunks = chunk_crud.create_chunks_batch(
@@ -473,11 +467,12 @@ class DatabasePersistenceStage(PipelineStage):
                 # Clear temporary chunk storage
                 doc_crud.clear_chunks(context.document_id)
 
-                logger.info(f"✓ Document {context.document_id} marked as COMPLETED")
+            logger.info(
+                "Document %s committed with %s chunks", context.document_id, len(created_chunks)
+            )
+            return context.with_update(vectors=[]).mark_stage_completed(self.name)
 
-            return context.mark_stage_completed(self.name)
-
-        except DatabaseError as e:
+        except (DatabaseError, VectorStoreError) as e:
             logger.error(f"Database persistence failed: {e}")
             return context.mark_stage_failed(self.name, str(e))
         except Exception as e:

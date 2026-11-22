@@ -122,6 +122,9 @@ class PipelineContext:
     stage_results: Dict[str, StageStatus] = field(default_factory=dict)
     error_messages: Dict[str, str] = field(default_factory=dict)
 
+    # Vectors computed for chunks, in the same order.
+    vectors: List[List[float]] = field(default_factory=list)
+
     def with_update(self, **kwargs) -> "PipelineContext":
         """
         Create new context with updated fields (immutable pattern).

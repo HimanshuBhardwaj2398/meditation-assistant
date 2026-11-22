@@ -344,11 +344,23 @@ class CollectionService:
                 reprocess_mode="from_chunking",
             )
 
-            new_chunk_count = result.get("chunk_count", 0)
-            logger.info(
-                f"Reprocessing complete for document {document_id}: "
-                f"{new_chunk_count} new chunks created"
-            )
+            success = bool(result.get("success"))
+            new_chunk_count = result.get("chunk_count", 0) if success else 0
+            error = None
+            if success:
+                logger.info(
+                    f"Reprocessing complete for document {document_id}: "
+                    f"{new_chunk_count} new chunks created"
+                )
+            else:
+                error = (
+                    "; ".join(
+                        f"{stage}: {message}"
+                        for stage, message in (result.get("errors") or {}).items()
+                    )
+                    or "Pipeline reported failure"
+                )
+                logger.error("Reprocessing failed for document %s: %s", document_id, error)
 
             return ReprocessResult(
                 document_id=document_id,
@@ -356,7 +368,8 @@ class CollectionService:
                 old_chunks_deleted=old_chunk_count,
                 old_embeddings_deleted=embeddings_deleted,
                 new_chunks_created=new_chunk_count,
-                success=True,
+                success=success,
+                error=error,
             )
 
         except Exception as e:

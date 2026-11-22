@@ -7,15 +7,15 @@ from core.interfaces import PipelineContext, StageStatus
 from ingestion.stages import EmbeddingStage
 
 
-class EchoIdsManager:
-    """Fake vector store that echoes Document.id values."""
+class RecordingEmbeddingManager:
+    """Fake embedding provider that records the chunks passed to it."""
 
     def __init__(self):
         self.last_documents = []
 
-    def embed_documents(self, documents):
+    def compute_embeddings(self, documents):
         self.last_documents = documents
-        return [doc.id for doc in documents]
+        return [[1.0, 0.0] for _ in documents]
 
 
 class MissingOneIdManager:
@@ -34,7 +34,7 @@ class DifferentIdsManager:
 
 @pytest.mark.asyncio
 async def test_embedding_stage_sets_uuid_and_document_metadata():
-    manager = EchoIdsManager()
+    manager = RecordingEmbeddingManager()
     stage = EmbeddingStage(manager)
     context = PipelineContext(
         document_id=42,
@@ -48,6 +48,7 @@ async def test_embedding_stage_sets_uuid_and_document_metadata():
     result = await stage.execute(context)
 
     assert result.stage_results["embedding"] == StageStatus.COMPLETED
+    assert result.vectors == [[1.0, 0.0], [1.0, 0.0]]
     for doc in manager.last_documents:
         assert doc.id is not None
         assert doc.metadata["uuid"] == doc.id
@@ -58,7 +59,7 @@ async def test_embedding_stage_sets_uuid_and_document_metadata():
 
 @pytest.mark.asyncio
 async def test_embedding_stage_fails_when_ids_missing():
-    stage = EmbeddingStage(MissingOneIdManager())
+    stage = EmbeddingStage(MissingOneIdManager(), vector_only=True)
     context = PipelineContext(
         chunks=[
             Document(page_content="chunk one", metadata={}),
@@ -69,12 +70,12 @@ async def test_embedding_stage_fails_when_ids_missing():
     result = await stage.execute(context)
 
     assert result.stage_results["embedding"] == StageStatus.FAILED
-    assert "Embedding mismatch" in result.error_messages["embedding"]
+    assert "Stored vector IDs do not match" in result.error_messages["embedding"]
 
 
 @pytest.mark.asyncio
 async def test_embedding_stage_fails_when_ids_do_not_match():
-    stage = EmbeddingStage(DifferentIdsManager())
+    stage = EmbeddingStage(DifferentIdsManager(), vector_only=True)
     context = PipelineContext(
         chunks=[
             Document(page_content="chunk one", metadata={}),
@@ -85,4 +86,4 @@ async def test_embedding_stage_fails_when_ids_do_not_match():
     result = await stage.execute(context)
 
     assert result.stage_results["embedding"] == StageStatus.FAILED
-    assert "Embedding ID mismatch" in result.error_messages["embedding"]
+    assert "Stored vector IDs do not match" in result.error_messages["embedding"]

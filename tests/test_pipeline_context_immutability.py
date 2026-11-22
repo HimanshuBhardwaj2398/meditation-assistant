@@ -17,15 +17,11 @@ from core.interfaces import PipelineContext, StageStatus
 from ingestion.stages import EmbeddingStage
 
 
-class EchoIdsManager:
-    """Fake vector store that echoes Document.id values."""
+class FakeEmbeddingManager:
+    """Fake provider for computing vectors without database access."""
 
-    def __init__(self):
-        self.last_documents = []
-
-    def embed_documents(self, documents):
-        self.last_documents = documents
-        return [doc.id for doc in documents]
+    def compute_embeddings(self, documents):
+        return [[1.0] for _ in documents]
 
 
 def test_pipeline_context_rejects_attribute_assignment():
@@ -50,7 +46,7 @@ async def test_embedding_stage_does_not_mutate_input_chunks():
         Document(page_content="chunk two", metadata={}),
     ]
     context = PipelineContext(document_id=42, title="Meditation Manual", chunks=input_chunks)
-    stage = EmbeddingStage(EchoIdsManager())
+    stage = EmbeddingStage(FakeEmbeddingManager())
 
     result = await stage.execute(context)
 
@@ -64,7 +60,7 @@ async def test_embedding_stage_does_not_mutate_input_chunks():
 async def test_embedding_stage_returns_enriched_copies():
     input_chunks = [Document(page_content="chunk one", metadata={"header": "Intro"})]
     context = PipelineContext(document_id=42, title="Meditation Manual", chunks=input_chunks)
-    stage = EmbeddingStage(EchoIdsManager())
+    stage = EmbeddingStage(FakeEmbeddingManager())
 
     result = await stage.execute(context)
 

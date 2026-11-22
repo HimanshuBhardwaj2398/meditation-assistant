@@ -72,15 +72,15 @@ dependencies, defined in [`ingestion/stages.py`](../ingestion/stages.py):
    then merges undersized fragments (details under
    [design decisions](#chunk-sizing-headers-first-semantic-boundaries-where-headers-run-out)).
 3. **`EmbeddingStage`** (requires chunking) — assigns each chunk a UUID (also
-   used as the PGVector row ID), tags it with `document_id` and source/nikāya
-   metadata, and batch-embeds via [`VectorStoreManager`](../ingestion/embed.py).
-   It then verifies the vector store returned exactly the assigned UUIDs — any
-   count or set mismatch fails the stage rather than silently desyncing the
-   two stores.
+   stored as PGVector's `custom_id`), tags it with `document_id` and source/nikāya
+   metadata, and computes vectors in batches via
+   [`VectorStoreManager`](../ingestion/embed.py). The vectors stay in memory
+   until publication.
 4. **`DatabasePersistenceStage`** (requires embedding) — inside one
-   `session_scope`, writes the chunk rows, builds a table of contents from the
-   chunks' header paths into `doc_metadata`, marks the document `COMPLETED`,
-   and clears the temporary chunk staging column.
+   `session_scope`, writes the vector and chunk rows, builds the table of
+   contents in `doc_metadata`, marks the document `COMPLETED`, and clears the
+   temporary chunk staging column. A write failure rolls back both sets of rows.
+   The application and vector store must use the same database URL.
 
 **Orchestration.** [`PipelineOrchestrator`](../ingestion/orchestrator.py)
 validates at construction that the stage graph has no cycles (DFS with a
@@ -183,8 +183,8 @@ Instead of forcing application metadata into that table, the relational side
 tracking, JSONB metadata, migrations — and joins to the vector side by UUID.
 The vector layer stays swappable (the community `PGVector` class is already
 deprecated upstream) without touching application data. The cost is a
-cross-store consistency obligation, paid deliberately: `EmbeddingStage`'s ID
-verification, the validation UI page, and
+cross-store consistency obligation, addressed by the shared transaction for
+publication, the validation UI page, and
 [`scripts/verify_database.py`](../scripts/verify_database.py).
 
 ### Callers own transactions

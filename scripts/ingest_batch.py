@@ -25,6 +25,7 @@ load_dotenv(_PROJECT_ROOT / ".env")
 from config.settings import DatabaseSettings, get_settings  # noqa: E402
 from db.crud import DocumentCRUD  # noqa: E402
 from db.database import Database, session_scope, set_default_database  # noqa: E402
+from db.schema import DocumentStatus
 from ingestion.embed import VectorStoreConfig  # noqa: E402
 from ingestion.orchestrator import IngestionOrchestrator  # noqa: E402
 
@@ -33,20 +34,33 @@ def _default_sources() -> list[str]:
     return [f"sc:mn{i}/sujato" for i in range(1, 6)]
 
 
-async def _ingest_all(sources: list[str], collection: str, neon_url: str) -> None:
+async def _ingest_all(sources: list[str], collection: str, neon_url: str) -> bool:
     orchestrator = IngestionOrchestrator(
         vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url)
     )
+    success = True
     for source in sources:
         with session_scope() as session:
-            if DocumentCRUD(session).check_duplicate(source):
-                print(f"skip (already ingested): {source}")
+            existing = DocumentCRUD(session).check_duplicate(source)
+            if existing:
+                if existing.status == DocumentStatus.COMPLETED:
+                    print(f"skip (already ingested): {source}")
+                else:
+                    print(
+                        f"skip (incomplete, status={existing.status.value}, "
+                        f"document_id={existing.id}; resume explicitly): {source}"
+                    )
+                    success = False
                 continue
         result = await orchestrator.process(source)
         print(
             f"ingested {source}: doc={result['document_id']} "
             f"chunks={result['chunk_count']} success={result['success']}"
         )
+        success = bool(result["success"]) and success
+        if result.get("errors"):
+            print(f"errors: {result['errors']}")
+    return success
 
 
 def main(argv: list[str]) -> None:
@@ -61,7 +75,8 @@ def main(argv: list[str]) -> None:
 
     collection = get_settings().vector.collection_name
     print(f"Batch-ingesting {len(sources)} source(s) into {collection!r} ...")
-    asyncio.run(_ingest_all(sources, collection, neon_url))
+    if not asyncio.run(_ingest_all(sources, collection, neon_url)):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

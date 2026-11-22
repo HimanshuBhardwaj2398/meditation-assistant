@@ -148,7 +148,11 @@ async def _run_shard(
 
                 if not result.get("success"):
                     raise RuntimeError(
-                        "; ".join(result.get("errors") or ["pipeline reported failure"])
+                        "; ".join(
+                            f"{stage}: {message}"
+                            for stage, message in (result.get("errors") or {}).items()
+                        )
+                        or "pipeline reported failure"
                     )
 
                 ingested += 1
@@ -282,6 +286,20 @@ def main(argv: Optional[List[str]] = None) -> None:
     for process in processes:
         process.join()
 
+    for worker_id, process in enumerate(processes):
+        if process.exitcode != 0 or worker_id not in results:
+            previous = results.get(worker_id, {"ingested": 0, "chunks": 0, "failures": []})
+            results[worker_id] = {
+                **previous,
+                "failures": previous["failures"]
+                + [
+                    {
+                        "source": f"<worker {worker_id}>",
+                        "error": f"Worker exited with code {process.exitcode}; shard may be incomplete",
+                    }
+                ],
+            }
+
     ingested = sum(r["ingested"] for r in results.values())
     chunks = sum(r["chunks"] for r in results.values())
     failures = [f for r in results.values() for f in r["failures"]]
@@ -299,6 +317,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"failure detail -> {failure_log}")
         for failure in failures[:10]:
             print(f"  {failure['source']}: {failure['error'][:120]}")
+    if failures or ingested != total:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

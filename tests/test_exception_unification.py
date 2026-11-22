@@ -42,7 +42,7 @@ async def test_embedding_stage_specific_handler_catches_manager_errors():
     """
 
     class ExplodingManager:
-        def embed_documents(self, documents):
+        def compute_embeddings(self, documents):
             from ingestion.embed import EmbeddingError
 
             raise EmbeddingError("vector store down")

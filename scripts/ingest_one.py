@@ -60,6 +60,8 @@ def main(argv: list[str]) -> None:
     print(f"stages      : {result['stage_results']}")
     if result.get("errors"):
         print(f"errors      : {result['errors']}")
+    if not result["success"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
