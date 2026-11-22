@@ -213,6 +213,9 @@ class IngestionOrchestrator:
         vector_store_config: VectorStoreConfig,
         chunking_config: Optional[ChunkingConfig] = None,
         enable_database_persistence: bool = True,
+        *,
+        parser_factory: Optional[ParserFactory] = None,
+        vector_store_manager: Optional[VectorStoreManager] = None,
     ):
         """
         Initialize ingestion orchestrator.
@@ -221,14 +224,20 @@ class IngestionOrchestrator:
             vector_store_config: Configuration for vector store
             chunking_config: Configuration for chunking (optional)
             enable_database_persistence: Enable database stage (default True)
+            parser_factory: Parser selection to use instead of the default
+                ParserFactory (tests inject a fake)
+            vector_store_manager: Vector adapter to use instead of one built
+                from vector_store_config (tests inject a fake)
         """
         self.vector_store_config = vector_store_config
         self.chunking_config = chunking_config or ChunkingConfig.from_settings()
         self.enable_database_persistence = enable_database_persistence
 
         # Initialize components
-        self.parser_factory = ParserFactory()
-        self.vector_store_manager = VectorStoreManager(config=vector_store_config)
+        self.parser_factory = parser_factory or ParserFactory()
+        self.vector_store_manager = vector_store_manager or VectorStoreManager(
+            config=vector_store_config
+        )
 
         logger.info("IngestionOrchestrator initialized with DAG pipeline")
 
