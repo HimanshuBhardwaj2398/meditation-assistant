@@ -64,6 +64,14 @@ poetry run python scripts/build_catalog.py dn mn   # -> data/suttacentral_catalo
 # PDF / URL ingestion
 poetry run python scripts/ingest.py "Books/sutra.pdf" --title "Diamond Sutra"
 
+# Corpus explorer (read-only): atlas snapshot -> Embedding Atlas map + Datasette tables
+poetry run python -m atlas.refresh --rebuild   # when the atlas cache is stale
+poetry run python -m atlas.explore             # -> data/atlas/explore.{parquet,db,json}
+uvx embedding-atlas@0.26.0 data/atlas/explore.parquet --text chunk_text --x x --y y \
+    --neighbors neighbors --labels data/atlas/explore_labels.parquet     # :5055
+uvx --with datasette-plot==0.1.0 datasette@1.0a43 data/atlas/explore.db \
+    -m atlas/explore_metadata.yaml -c atlas/explore_datasette.yaml       # :8001
+
 # Quality gates (CI runs lint, format check, mypy, and tests on every push/PR to main)
 poetry run pytest --cov                  # 23 test modules; external services faked
 poetry run ruff check . && poetry run mypy .   # mypy is non-blocking in CI for now
