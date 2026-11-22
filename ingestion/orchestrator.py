@@ -1,17 +1,20 @@
 """
-DAG-based pipeline orchestrator for document ingestion.
+Document ingestion orchestration.
 
-Replaces linear state machine with dependency-aware stage execution.
+``PipelineOrchestrator`` runs stages in dependency order. ``IngestionOrchestrator``
+prepares one document (creates it, or loads it to resume or reprocess), runs the
+pipeline on it, and records progress in ``documents.status``.
 """
 
 import logging
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
 # LangChain Document for type hints
-from langchain.schema import Document as LangchainDocument
+from langchain_core.documents import Document as LangchainDocument
 
-from core.exceptions import DocumentNotFoundError, PipelineError
+from core.exceptions import DocumentNotFoundError, MeditationDBError, PipelineError
 from core.interfaces import PipelineContext, PipelineStage, StageStatus
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
@@ -23,6 +26,7 @@ from ingestion.stages import (
     ParsingStage,
     source_provenance,
 )
+from ingestion.status import StatusRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +141,7 @@ class PipelineOrchestrator:
     async def execute(
         self,
         context: PipelineContext,
-        on_stage_update: Optional[callable] = None,
+        on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
     ) -> PipelineContext:
         """
         Execute pipeline stages in dependency order.
@@ -169,43 +173,86 @@ class PipelineOrchestrator:
                     for dep in stage.required_stages
                     if current_context.stage_results.get(dep) != StageStatus.COMPLETED
                 ]
-                logger.warning(f"Stage '{stage.name}' cannot run. Missing dependencies: {missing}")
+                failed = [
+                    dep
+                    for dep in missing
+                    if current_context.stage_results.get(dep) == StageStatus.FAILED
+                ]
+                if failed:
+                    logger.info(f"Skipping stage '{stage.name}': {failed} failed")
+                else:
+                    logger.warning(
+                        f"Stage '{stage.name}' cannot run. Missing dependencies: {missing}"
+                    )
                 continue
 
-            # Execute stage
+            # Execute stage. Stages raise when they cannot finish; this is the
+            # one place an exception becomes a FAILED stage with its message.
             logger.info(f"Executing stage: {stage.name}")
             _notify(stage.name, StageStatus.RUNNING)
             try:
                 current_context = await stage.execute(current_context)
-
-                # Check if stage failed
-                if current_context.stage_results.get(stage.name) == StageStatus.FAILED:
-                    error = current_context.error_messages.get(stage.name, "Unknown error")
-                    logger.error(f"Stage '{stage.name}' failed: {error}")
-                    _notify(stage.name, StageStatus.FAILED)
-                    # Continue to next stage (allows partial processing)
-                else:
-                    _notify(stage.name, StageStatus.COMPLETED)
-
-            except Exception as e:
-                logger.error(f"Unexpected error in stage '{stage.name}': {e}", exc_info=True)
+            except MeditationDBError as e:
+                # Expected failures (ParsingError, EmbeddingError, ...) keep their message.
                 current_context = current_context.mark_stage_failed(stage.name, str(e))
+            except Exception as e:
+                logger.error("Unexpected error in stage '%s'", stage.name, exc_info=True)
+                current_context = current_context.mark_stage_failed(
+                    stage.name, f"Unexpected {type(e).__name__}: {e}"
+                )
+
+            if current_context.stage_results.get(stage.name) == StageStatus.FAILED:
+                error = current_context.error_messages.get(stage.name, "Unknown error")
+                logger.error(f"Stage '{stage.name}' failed: {error}")
                 _notify(stage.name, StageStatus.FAILED)
+                # Later stages that depend on this one are skipped below.
+            else:
+                _notify(stage.name, StageStatus.COMPLETED)
 
         return current_context
 
 
 # ============================================================================
-# HIGH-LEVEL INGESTION ORCHESTRATOR (backward compatible API)
+# HIGH-LEVEL INGESTION ORCHESTRATOR
 # ============================================================================
+
+
+class IngestionResult(TypedDict):
+    """What ``IngestionOrchestrator.process`` reports for one document."""
+
+    document_id: int
+    source: Optional[str]
+    title: Optional[str]
+    chunk_count: int
+    reprocess_mode: Optional[str]
+    stage_results: Dict[str, str]
+    errors: Dict[str, str]
+    success: bool
+
+
+@dataclass
+class _PreparedRun:
+    """Everything the pipeline needs to start on one document."""
+
+    document_id: int
+    source: Optional[str]
+    title: Optional[str]
+    parsed_content: Optional[str] = None
+    chunks: List[LangchainDocument] = field(default_factory=list)
+    stage_results: Dict[str, StageStatus] = field(default_factory=dict)
+    source_metadata: Dict[str, Any] = field(default_factory=dict)
+    # What a reprocess clears before the rerun.
+    previous_chunk_uuids: List[str] = field(default_factory=list)
+    doc_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class IngestionOrchestrator:
     """
     High-level orchestrator for document ingestion.
 
-    Provides backward-compatible API while using DAG pipeline internally.
-    Includes database persistence for tracking document and chunk metadata.
+    Prepares a document (creates it, or loads it to resume or reprocess),
+    runs the stage pipeline on it, and mirrors progress into
+    ``documents.status``.
     """
 
     def __init__(
@@ -265,7 +312,7 @@ class IngestionOrchestrator:
         on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
         reprocess_mode: Optional[Union[ReprocessMode, str]] = None,
         clear_markdown: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> IngestionResult:
         """
         Process a document through the ingestion pipeline.
 
@@ -283,329 +330,238 @@ class IngestionOrchestrator:
                 documents.markdown before pipeline execution.
 
         Returns:
-            Dictionary with processing results:
-                - document_id: Database ID of the document
-                - source: Original source
-                - title: Extracted title
-                - chunk_count: Number of chunks created
-                - stage_results: Status of each stage
-                - errors: Any error messages
-                - success: Whether pipeline completed successfully
+            The run's IngestionResult: the document id, source, title, chunk
+            count, each stage's status, error messages, and whether it
+            succeeded.
         """
-        from db.crud import ChunkCRUD, DocumentCRUD
-        from db.database import session_scope
-        from db.schema import DocumentStatus
-
         mode = self._parse_reprocess_mode(reprocess_mode)
         if clear_markdown and mode != ReprocessMode.FULL:
             raise PipelineError("clear_markdown is only supported with reprocess_mode='full'")
 
-        # Create or load document
-        document_id = None
-        seeded_parsed_content: Optional[str] = None
-        seeded_chunks: List[LangchainDocument] = []
-        seeded_stage_results: Dict[str, StageStatus] = {}
-        seeded_source_metadata: Dict[str, Any] = {}
-
         if isinstance(source, int):
-            # Resume existing document
-            chunk_uuids: List[str] = []
-            with session_scope() as session:
-                if self.enable_database_persistence:
-                    self.vector_store_manager.validate_database(session)
-                doc_crud = DocumentCRUD(session)
-                chunk_crud = ChunkCRUD(session)
-
-                doc = doc_crud.get_document_by_id(source)
-                if not doc:
-                    raise DocumentNotFoundError(f"Document {source} not found")
-
-                source = doc.file_path
-                if mode in (ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING):
-                    title = title or doc.title
-                    seeded_source_metadata = source_provenance(doc.doc_metadata or {})
-                elif doc.title != "Untitled":
-                    title = title or doc.title
-                document_id = doc.id
-                existing_markdown = doc.markdown
-                existing_doc_metadata = dict(doc.doc_metadata or {})
-
-                existing_chunks = chunk_crud.get_chunks_by_document(document_id)
-                chunk_uuids = [chunk.uuid for chunk in existing_chunks]
-
-                if mode == ReprocessMode.FROM_CHUNKING:
-                    if not existing_markdown:
-                        raise PipelineError(
-                            f"Document {document_id} has no stored markdown; "
-                            "cannot start from chunking"
-                        )
-                    seeded_parsed_content = existing_markdown
-                    seeded_stage_results = {"parsing": StageStatus.COMPLETED}
-                elif mode == ReprocessMode.FROM_EMBEDDING:
-                    if not existing_chunks:
-                        raise PipelineError(
-                            f"Document {document_id} has no stored chunks; "
-                            "cannot start from embedding"
-                        )
-                    seeded_stage_results = {
-                        "parsing": StageStatus.COMPLETED,
-                        "chunking": StageStatus.COMPLETED,
-                    }
-                    for chunk_row in existing_chunks:
-                        metadata = dict(chunk_row.chunk_metadata or {})
-                        metadata["uuid"] = chunk_row.uuid
-                        seeded_chunks.append(
-                            LangchainDocument(
-                                page_content=chunk_row.chunk_text,
-                                metadata=metadata,
-                            )
-                        )
-
-                if mode == ReprocessMode.FULL and not source:
-                    raise PipelineError(
-                        f"Document {document_id} is missing file_path; "
-                        "cannot reprocess from parsing"
-                    )
-
+            run = self._load_existing(source, title, mode)
             if mode is not None:
-                if chunk_uuids:
-                    try:
-                        deleted_embeddings = self.vector_store_manager.delete_by_ids(chunk_uuids)
-                        logger.info(
-                            "Deleted %s existing embeddings for document %s",
-                            deleted_embeddings,
-                            document_id,
-                        )
-                    except Exception as e:
-                        raise PipelineError(
-                            f"Failed to clear existing embeddings for document {document_id}: {e}"
-                        ) from e
-
-                with session_scope() as session:
-                    doc_crud = DocumentCRUD(session)
-                    chunk_crud = ChunkCRUD(session)
-                    doc = doc_crud.get_document_by_id(document_id)
-                    if not doc:
-                        raise DocumentNotFoundError(f"Document {document_id} not found")
-
-                    deleted_chunks = chunk_crud.delete_chunks_by_document(document_id)
-                    logger.info(
-                        "Deleted %s existing chunk rows for document %s",
-                        deleted_chunks,
-                        document_id,
-                    )
-
-                    doc.chunks = None
-                    if clear_markdown:
-                        doc.markdown = None
-
-                    # Remove stale derived metadata before rerun.
-                    if existing_doc_metadata.pop("table_of_contents", None) is not None:
-                        doc.doc_metadata = existing_doc_metadata
-
-                    doc.status = DocumentStatus.PENDING
-                    doc.status_details = f"Reprocessing ({mode.value}) - pipeline rerun requested"
-
-                logger.info(
-                    "Reprocessing document %s (%s, clear_markdown=%s)",
-                    document_id,
-                    mode.value,
-                    clear_markdown,
-                )
+                self._clear_for_reprocess(run, mode, clear_markdown)
             else:
-                logger.info(f"Resuming document {document_id}: {title}")
+                logger.info(f"Resuming document {run.document_id}: {run.title}")
         else:
             if mode is not None:
                 raise PipelineError(
                     "reprocess_mode can only be used when source is an existing document ID"
                 )
-            # Create new document
-            with session_scope() as session:
-                if self.enable_database_persistence:
-                    self.vector_store_manager.validate_database(session)
-                doc = DocumentCRUD(session).create_document(
-                    title=title or "Untitled",
-                    file_path=source,
-                    status=DocumentStatus.PENDING,
-                )
-                document_id = doc.id
-                logger.info(f"Created document {document_id} for source: {source}")
+            run = self._create_document(source, title)
 
-        stage_running_status = {
-            "parsing": DocumentStatus.PARSING,
-            "chunking": DocumentStatus.CHUNKING,
-            "embedding": DocumentStatus.EMBEDDING,
-            # No dedicated persistence enum; keep this under embedding phase.
-            "database_persistence": DocumentStatus.EMBEDDING,
-        }
-        stage_completed_status = {
-            "parsing": DocumentStatus.PARSED,
-            "chunking": DocumentStatus.CHUNKED,
-            # Keep EMBEDDING until database persistence marks COMPLETED.
-            "embedding": DocumentStatus.EMBEDDING,
-        }
+        return await self._run_pipeline(run, mode, on_stage_update)
 
-        def _persist_stage_status(stage_name: str, stage_status: StageStatus) -> None:
-            """Mirror pipeline stage transitions into document.status for visibility."""
-            if not document_id:
-                return
+    # ------------------------------------------------------------------
+    # Preparing a document
+    # ------------------------------------------------------------------
 
-            mapped_status: Optional[DocumentStatus] = None
-            if stage_status == StageStatus.RUNNING:
-                mapped_status = stage_running_status.get(stage_name)
-            elif stage_status == StageStatus.COMPLETED:
-                mapped_status = stage_completed_status.get(stage_name)
-            elif stage_status == StageStatus.FAILED:
-                mapped_status = DocumentStatus.FAILED
+    def _create_document(self, source: str, title: Optional[str]) -> _PreparedRun:
+        """Insert a PENDING row for a new source."""
+        from db.crud import DocumentCRUD
+        from db.database import session_scope
+        from db.schema import DocumentStatus
 
-            if mapped_status is None:
-                return
+        with session_scope() as session:
+            if self.enable_database_persistence:
+                self.vector_store_manager.validate_database(session)
+            doc = DocumentCRUD(session).create_document(
+                title=title or "Untitled",
+                file_path=source,
+                status=DocumentStatus.PENDING,
+            )
+            document_id = doc.id
+        logger.info(f"Created document {document_id} for source: {source}")
+        return _PreparedRun(document_id=document_id, source=source, title=title)
 
-            try:
-                with session_scope() as session:
-                    DocumentCRUD(session).update_status(
-                        document_id=document_id,
-                        status=mapped_status,
-                        status_details=f"Stage '{stage_name}' {stage_status.value}",
+    def _load_existing(
+        self,
+        document_id: int,
+        title: Optional[str],
+        mode: Optional[ReprocessMode],
+    ) -> _PreparedRun:
+        """Load a document to resume or reprocess, seeding the stages it reuses."""
+        from db.crud import ChunkCRUD, DocumentCRUD
+        from db.database import session_scope
+
+        with session_scope() as session:
+            if self.enable_database_persistence:
+                self.vector_store_manager.validate_database(session)
+            doc = DocumentCRUD(session).get_document_by_id(document_id)
+            if not doc:
+                raise DocumentNotFoundError(f"Document {document_id} not found")
+
+            run = _PreparedRun(
+                document_id=doc.id,
+                source=doc.file_path,
+                title=title,
+                doc_metadata=dict(doc.doc_metadata or {}),
+            )
+            if mode in (ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING):
+                run.title = title or doc.title
+                run.source_metadata = source_provenance(doc.doc_metadata or {})
+            elif doc.title != "Untitled":
+                run.title = title or doc.title
+
+            existing_chunks = ChunkCRUD(session).get_chunks_by_document(doc.id)
+            run.previous_chunk_uuids = [chunk.uuid for chunk in existing_chunks]
+
+            if mode == ReprocessMode.FROM_CHUNKING:
+                if not doc.markdown:
+                    raise PipelineError(
+                        f"Document {doc.id} has no stored markdown; cannot start from chunking"
                     )
+                run.parsed_content = doc.markdown
+                run.stage_results = {"parsing": StageStatus.COMPLETED}
+            elif mode == ReprocessMode.FROM_EMBEDDING:
+                if not existing_chunks:
+                    raise PipelineError(
+                        f"Document {doc.id} has no stored chunks; cannot start from embedding"
+                    )
+                run.stage_results = {
+                    "parsing": StageStatus.COMPLETED,
+                    "chunking": StageStatus.COMPLETED,
+                }
+                for chunk_row in existing_chunks:
+                    metadata = dict(chunk_row.chunk_metadata or {})
+                    metadata["uuid"] = chunk_row.uuid
+                    run.chunks.append(
+                        LangchainDocument(page_content=chunk_row.chunk_text, metadata=metadata)
+                    )
+
+            if mode == ReprocessMode.FULL and not run.source:
+                raise PipelineError(
+                    f"Document {doc.id} is missing file_path; cannot reprocess from parsing"
+                )
+        return run
+
+    def _clear_for_reprocess(
+        self, run: _PreparedRun, mode: ReprocessMode, clear_markdown: bool
+    ) -> None:
+        """Delete the document's vectors and chunk rows and reset it to PENDING."""
+        from db.crud import ChunkCRUD, DocumentCRUD
+        from db.database import session_scope
+        from db.schema import DocumentStatus
+
+        document_id = run.document_id
+        if run.previous_chunk_uuids:
+            try:
+                deleted_embeddings = self.vector_store_manager.delete_by_ids(
+                    run.previous_chunk_uuids
+                )
                 logger.info(
-                    "Document %s status -> %s (%s: %s)",
+                    "Deleted %s existing embeddings for document %s",
+                    deleted_embeddings,
                     document_id,
-                    mapped_status.value,
-                    stage_name,
-                    stage_status.value,
                 )
             except Exception as e:
-                logger.warning(
-                    "Failed to persist stage status for document %s (%s=%s): %s",
-                    document_id,
-                    stage_name,
-                    stage_status.value,
-                    e,
-                )
+                raise PipelineError(
+                    f"Failed to clear existing embeddings for document {document_id}: {e}"
+                ) from e
 
-        def _on_stage_update(stage_name: str, stage_status: StageStatus) -> None:
-            _persist_stage_status(stage_name, stage_status)
-            if on_stage_update is not None:
-                on_stage_update(stage_name, stage_status)
+        with session_scope() as session:
+            doc = DocumentCRUD(session).get_document_by_id(document_id)
+            if not doc:
+                raise DocumentNotFoundError(f"Document {document_id} not found")
 
-        # Build pipeline stages
-        stages = [
+            deleted_chunks = ChunkCRUD(session).delete_chunks_by_document(document_id)
+            logger.info(
+                "Deleted %s existing chunk rows for document %s", deleted_chunks, document_id
+            )
+
+            doc.chunks = None
+            if clear_markdown:
+                doc.markdown = None
+
+            # Remove stale derived metadata before rerun.
+            doc_metadata = dict(run.doc_metadata)
+            if doc_metadata.pop("table_of_contents", None) is not None:
+                doc.doc_metadata = doc_metadata
+
+            doc.status = DocumentStatus.PENDING
+            doc.status_details = f"Reprocessing ({mode.value}) - pipeline rerun requested"
+
+        logger.info(
+            "Reprocessing document %s (%s, clear_markdown=%s)",
+            document_id,
+            mode.value,
+            clear_markdown,
+        )
+
+    # ------------------------------------------------------------------
+    # Running the pipeline
+    # ------------------------------------------------------------------
+
+    def _build_stages(self) -> List[PipelineStage]:
+        stages: List[PipelineStage] = [
             ParsingStage(self.parser_factory),
             ChunkingStage(self.chunking_config),
             EmbeddingStage(
                 self.vector_store_manager, vector_only=not self.enable_database_persistence
             ),
         ]
-
-        # Add database persistence stage if enabled
         if self.enable_database_persistence:
             stages.append(DatabasePersistenceStage(self.vector_store_manager))
+        return stages
 
-        # Create orchestrator
-        pipeline = PipelineOrchestrator(stages)
+    @property
+    def _final_stage(self) -> str:
+        """The stage whose completion means the document is done."""
+        return "database_persistence" if self.enable_database_persistence else "embedding"
 
-        # Build initial context
+    async def _run_pipeline(
+        self,
+        run: _PreparedRun,
+        mode: Optional[ReprocessMode],
+        on_stage_update: Optional[Callable[[str, StageStatus], None]],
+    ) -> IngestionResult:
+        """Run the stages on a prepared document and report the outcome."""
+        recorder = StatusRecorder(run.document_id)
+
+        def _on_stage_update(stage_name: str, stage_status: StageStatus) -> None:
+            recorder.record(stage_name, stage_status)
+            if on_stage_update is not None:
+                on_stage_update(stage_name, stage_status)
+
+        pipeline = PipelineOrchestrator(self._build_stages())
         context = PipelineContext(
-            document_id=document_id,
-            source=source,
-            title=title,
-            parsed_content=seeded_parsed_content,
-            chunks=seeded_chunks,
-            stage_results=seeded_stage_results,
-            source_metadata=seeded_source_metadata,
+            document_id=run.document_id,
+            source=run.source,
+            title=run.title,
+            parsed_content=run.parsed_content,
+            chunks=run.chunks,
+            stage_results=run.stage_results,
+            source_metadata=run.source_metadata,
         )
 
         try:
-            # Execute pipeline
-            logger.info(f"Starting pipeline for document {document_id}")
-            final_context = await pipeline.execute(
-                context,
-                on_stage_update=_on_stage_update,
-            )
+            logger.info(f"Starting pipeline for document {run.document_id}")
+            final_context = await pipeline.execute(context, on_stage_update=_on_stage_update)
 
-            # Check completion status
-            if self.enable_database_persistence:
-                success_stage = "database_persistence"
-            else:
-                success_stage = "embedding"
-
-            status = final_context.stage_results.get(success_stage)
-            success = status == StageStatus.COMPLETED
-
-            # Build result
-            result = {
-                "document_id": document_id,
-                "source": source,
-                "title": final_context.title,
-                "chunk_count": len(final_context.chunks) if final_context.chunks else 0,
-                "reprocess_mode": mode.value if mode else None,
-                "stage_results": {
+            success = final_context.stage_results.get(self._final_stage) == StageStatus.COMPLETED
+            result = IngestionResult(
+                document_id=run.document_id,
+                source=run.source,
+                title=final_context.title,
+                chunk_count=len(final_context.chunks) if final_context.chunks else 0,
+                reprocess_mode=mode.value if mode else None,
+                stage_results={
                     name: status.value for name, status in final_context.stage_results.items()
                 },
-                "errors": final_context.error_messages,
-                "success": success,
-            }
+                errors=final_context.error_messages,
+                success=success,
+            )
 
             if success:
-                logger.info(f"Pipeline completed successfully for document {document_id}")
+                logger.info(f"Pipeline completed successfully for document {run.document_id}")
             else:
-                logger.warning(f"Pipeline partially completed for document {document_id}")
-                # Update document status to FAILED
-                with session_scope() as session:
-                    DocumentCRUD(session).update_status(
-                        document_id=document_id,
-                        status=DocumentStatus.FAILED,
-                        status_details=str(final_context.error_messages),
-                    )
+                logger.warning(f"Pipeline partially completed for document {run.document_id}")
+                recorder.fail(str(final_context.error_messages))
 
             return result
 
         except Exception as e:
-            logger.error(f"Pipeline failed for document {document_id}: {e}", exc_info=True)
-            # Update document status to FAILED
-            with session_scope() as session:
-                DocumentCRUD(session).update_status(
-                    document_id=document_id,
-                    status=DocumentStatus.FAILED,
-                    status_details=str(e),
-                )
+            logger.error(f"Pipeline failed for document {run.document_id}: {e}", exc_info=True)
+            recorder.fail(str(e))
             raise PipelineError(f"Pipeline execution failed: {e}") from e
-
-
-# ============================================================================
-# MAIN (for testing)
-# ============================================================================
-
-if __name__ == "__main__":
-    """
-    Test orchestrator with sample document.
-
-    To run: python -m ingestion.orchestrator
-    """
-    import asyncio
-
-    from config.logging_config import setup_logging
-
-    setup_logging()
-
-    # Create orchestrator
-    orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name="buddhist_texts")
-    )
-
-    # Test with a source (update this to a real file path or URL)
-    source = "https://example.com"  # or "path/to/file.pdf"
-
-    try:
-        result = asyncio.run(orchestrator.process(source))
-        logger.info("=== Pipeline Result ===")
-        logger.info("Source: %s", result["source"])
-        logger.info("Title: %s", result["title"])
-        logger.info("Chunks: %s", result["chunk_count"])
-        logger.info("Success: %s", result["success"])
-        logger.info("Stage Results: %s", result["stage_results"])
-        if result["errors"]:
-            logger.error("Errors: %s", result["errors"])
-    except Exception:
-        logger.exception("Pipeline failed")

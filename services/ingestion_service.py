@@ -13,21 +13,25 @@ from db.crud import DocumentCRUD
 from db.database import session_scope
 from db.schema import DocumentStatus
 from ingestion.embed import VectorStoreConfig
-from ingestion.orchestrator import IngestionOrchestrator
+from ingestion.orchestrator import IngestionOrchestrator, IngestionResult
 
 
-def get_orchestrator(collection_name: str = "buddhist_texts") -> IngestionOrchestrator:
+def get_orchestrator(collection_name: Optional[str] = None) -> IngestionOrchestrator:
     """Initialize ingestion orchestrator with vector store config.
 
     Args:
-        collection_name: Name of the collection to store embeddings in
+        collection_name: Name of the collection to store embeddings in;
+            None means the configured default (VECTOR_COLLECTION_NAME)
 
     Returns:
         Configured IngestionOrchestrator instance
     """
-    return IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name=collection_name)
+    config = (
+        VectorStoreConfig(collection_name=collection_name)
+        if collection_name
+        else VectorStoreConfig()
     )
+    return IngestionOrchestrator(vector_store_config=config)
 
 
 async def ingest_document_async(
@@ -37,9 +41,9 @@ async def ingest_document_async(
     doc_type: str,
     category: str,
     tags: list,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
-) -> dict:
+) -> IngestionResult:
     """
     Ingest document with metadata.
 
@@ -114,9 +118,9 @@ def ingest_document(
     doc_type: str,
     category: str,
     tags: list,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
-) -> dict:
+) -> IngestionResult:
     """Synchronous wrapper for async ingestion."""
     return asyncio.run(
         ingest_document_async(
@@ -134,11 +138,11 @@ def ingest_document(
 
 async def process_document_by_id_async(
     doc_id: int,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
     reprocess_mode: Optional[str] = None,
     clear_markdown: bool = False,
-) -> dict:
+) -> IngestionResult:
     """
     Process/resume a document by its ID.
 
@@ -163,11 +167,11 @@ async def process_document_by_id_async(
 
 def process_document_by_id(
     doc_id: int,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
     reprocess_mode: Optional[str] = None,
     clear_markdown: bool = False,
-) -> dict:
+) -> IngestionResult:
     """Synchronous wrapper for async document processing."""
     return asyncio.run(
         process_document_by_id_async(

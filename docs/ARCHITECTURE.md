@@ -87,8 +87,12 @@ validates at construction that the stage graph has no cycles (DFS with a
 recursion stack), then computes execution order with a topological sort. At
 run time it skips stages already `COMPLETED` in the context, refuses stages
 whose dependencies didn't complete, and keeps going after a failure so
-independent work still runs; failures are recorded per-stage in the context
-and the document is marked `FAILED`.
+independent work still runs. Stages raise when they cannot finish; the
+orchestrator is the one place that records the failure, keeping a
+`MeditationDBError`'s message as-is and prefixing anything else with its
+exception type. `IngestionOrchestrator` then marks the document `FAILED`.
+Stage transitions reach `documents.status` through
+[`StatusRecorder`](../ingestion/status.py).
 
 **Idempotency and resume.** The frozen
 [`PipelineContext`](../core/interfaces.py) carries `stage_results`, so re-runs

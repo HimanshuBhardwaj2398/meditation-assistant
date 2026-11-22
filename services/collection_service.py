@@ -10,7 +10,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from config.settings import DatabaseSettings
+from config.settings import DatabaseSettings, VectorSettings
 from core.exceptions import DocumentNotFoundError, VectorStoreError
 from db.crud import ChunkCRUD, DocumentCRUD, get_all_collections
 from db.database import session_scope
@@ -59,17 +59,18 @@ class CollectionService:
 
     def __init__(
         self,
-        collection_name: str = "buddhist_texts",
+        collection_name: Optional[str] = None,
         db_url: Optional[str] = None,
     ):
         """
         Initialize collection service.
 
         Args:
-            collection_name: Name of the vector store collection
+            collection_name: Name of the vector store collection (defaults to
+                VECTOR_COLLECTION_NAME)
             db_url: Database URL (defaults to database settings)
         """
-        self.collection_name = collection_name
+        self.collection_name = collection_name or VectorSettings().collection_name
         self.db_url = db_url or DatabaseSettings().url
 
         self._vector_store_manager: Optional[VectorStoreManager] = None

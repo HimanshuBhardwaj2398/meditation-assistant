@@ -3,6 +3,7 @@
 import pytest
 from langchain.schema import Document
 
+from core.exceptions import EmbeddingError
 from core.interfaces import PipelineContext, StageStatus
 from ingestion.stages import EmbeddingStage
 
@@ -67,10 +68,8 @@ async def test_embedding_stage_fails_when_ids_missing():
         ]
     )
 
-    result = await stage.execute(context)
-
-    assert result.stage_results["embedding"] == StageStatus.FAILED
-    assert "Stored vector IDs do not match" in result.error_messages["embedding"]
+    with pytest.raises(EmbeddingError, match="Stored vector IDs do not match"):
+        await stage.execute(context)
 
 
 @pytest.mark.asyncio
@@ -83,7 +82,5 @@ async def test_embedding_stage_fails_when_ids_do_not_match():
         ]
     )
 
-    result = await stage.execute(context)
-
-    assert result.stage_results["embedding"] == StageStatus.FAILED
-    assert "Stored vector IDs do not match" in result.error_messages["embedding"]
+    with pytest.raises(EmbeddingError, match="Stored vector IDs do not match"):
+        await stage.execute(context)

@@ -6,7 +6,7 @@ and managing the connection to PostgreSQL with pgvector extension.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -32,15 +32,37 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _default_voyage_model() -> str:
+    from config.settings import EmbeddingSettings
+
+    return EmbeddingSettings().voyage_model
+
+
+def _default_batch_size() -> int:
+    from config.settings import EmbeddingSettings
+
+    return EmbeddingSettings().batch_size
+
+
+def _default_collection() -> str:
+    from config.settings import VectorSettings
+
+    return VectorSettings().collection_name
+
+
 @dataclass
 class VectorStoreConfig:
-    """Configuration for vector store operations."""
+    """Configuration for vector store operations.
 
-    model_name: str = "voyage-3.5"
-    collection_name: str = "buddhist_texts"
+    Unset fields come from settings, the same ones retrieval reads, so stored
+    vectors and query vectors cannot silently use different models.
+    """
+
+    model_name: str = field(default_factory=_default_voyage_model)
+    collection_name: str = field(default_factory=_default_collection)
     db_url: Optional[str] = None
     use_jsonb: bool = True
-    batch_size: int = 100
+    batch_size: int = field(default_factory=_default_batch_size)
 
     def __post_init__(self):
         """Resolve the database URL from settings when not passed explicitly."""
@@ -73,8 +95,14 @@ class VectorStoreManager:
     def embeddings(self) -> Embeddings:
         """Lazy-load embeddings client."""
         if self._embeddings is None:
+            from config.settings import EmbeddingSettings
+
+            # Settings read .env without exporting it, so pass the key along
+            # rather than rely on VOYAGE_API_KEY being in os.environ.
+            api_key = EmbeddingSettings().voyage_api_key
+            key_kwargs = {"voyage_api_key": api_key} if api_key else {}
             try:
-                self._embeddings = VoyageAIEmbeddings(model=self.config.model_name)
+                self._embeddings = VoyageAIEmbeddings(model=self.config.model_name, **key_kwargs)
                 logger.info(f"Initialized embeddings with model: {self.config.model_name}")
             except Exception as e:
                 raise EmbeddingError(f"Failed to initialize embeddings: {e}") from e
