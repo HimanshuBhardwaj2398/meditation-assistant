@@ -5,29 +5,36 @@ Handles document ingestion, processing, and orchestration.
 """
 
 import asyncio
+from functools import lru_cache
 from typing import Callable, Optional
 
-from core.exceptions import DuplicateDocumentError
 from core.interfaces import StageStatus
-from db.crud import DocumentCRUD
-from db.database import session_scope
-from db.schema import DocumentStatus
 from ingestion.embed import VectorStoreConfig
-from ingestion.orchestrator import IngestionOrchestrator
+from ingestion.orchestrator import IngestionOrchestrator, IngestionResult
 
 
-def get_orchestrator(collection_name: str = "buddhist_texts") -> IngestionOrchestrator:
-    """Initialize ingestion orchestrator with vector store config.
+@lru_cache(maxsize=None)
+def get_orchestrator(collection_name: Optional[str] = None) -> IngestionOrchestrator:
+    """The process's ingestion orchestrator for a collection.
+
+    Cached, so the vector store (its tables, its collection row, its engine)
+    is set up once per process rather than on every ingest. The orchestrator
+    keeps no per-document state between runs. Tests that change settings call
+    ``get_orchestrator.cache_clear()``.
 
     Args:
-        collection_name: Name of the collection to store embeddings in
+        collection_name: Name of the collection to store embeddings in;
+            None means the configured default (VECTOR_COLLECTION_NAME)
 
     Returns:
         Configured IngestionOrchestrator instance
     """
-    return IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name=collection_name)
+    config = (
+        VectorStoreConfig(collection_name=collection_name)
+        if collection_name
+        else VectorStoreConfig()
     )
+    return IngestionOrchestrator(vector_store_config=config)
 
 
 async def ingest_document_async(
@@ -37,9 +44,9 @@ async def ingest_document_async(
     doc_type: str,
     category: str,
     tags: list,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
-) -> dict:
+) -> IngestionResult:
     """
     Ingest document with metadata.
 
@@ -54,24 +61,13 @@ async def ingest_document_async(
         on_stage_update: Optional callback(stage_name, status) for progress updates
 
     Returns:
-        dict: Result from orchestrator with success status and chunk count
+        The orchestrator's result. A source already in the corpus is not
+        processed again: the result has ``already_completed=True`` and the
+        existing document's id. A source that failed before is resumed.
 
     Raises:
-        DuplicateDocumentError: If document with same source already exists
+        DocumentBusyError: Another run is processing the same source
     """
-    # Check for duplicates first
-    with session_scope() as session:
-        crud = DocumentCRUD(session)
-        existing_doc = crud.check_duplicate(source)
-        if existing_doc:
-            raise DuplicateDocumentError(
-                f"Document with source '{source}' already exists "
-                f"(ID: {existing_doc.id}, Title: '{existing_doc.title}', "
-                f"Status: {existing_doc.status.value})"
-            )
-
-    orchestrator = get_orchestrator(collection_name)
-
     # Build metadata
     metadata = {}
     if doc_type:
@@ -86,25 +82,22 @@ async def ingest_document_async(
     if category:
         all_tags.append(f"category:{category}")
 
-    # Create document first with metadata
-    with session_scope() as session:
-        doc = DocumentCRUD(session).create_document(
-            title=title,
-            file_path=source,
-            description=description,
-            doc_metadata=metadata,
-            tags=all_tags,
-            status=DocumentStatus.PENDING,
-        )
-        doc_id = doc.id
+    orchestrator = get_orchestrator(collection_name)
 
-    # Process through pipeline
-    result = await orchestrator.process(
-        source=doc_id,
+    # Find or create the document; the metadata (and the collection) apply
+    # only to a new one. An existing document keeps its own collection.
+    admission = orchestrator.admit(
+        source,
+        title=title,
+        description=description,
+        tags=all_tags,
+        doc_metadata=metadata,
+    )
+    return await orchestrator.process(
+        source=admission.document_id,
         title=title,
         on_stage_update=on_stage_update,
     )
-    return result
 
 
 def ingest_document(
@@ -114,9 +107,9 @@ def ingest_document(
     doc_type: str,
     category: str,
     tags: list,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
-) -> dict:
+) -> IngestionResult:
     """Synchronous wrapper for async ingestion."""
     return asyncio.run(
         ingest_document_async(
@@ -134,11 +127,11 @@ def ingest_document(
 
 async def process_document_by_id_async(
     doc_id: int,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
     reprocess_mode: Optional[str] = None,
     clear_markdown: bool = False,
-) -> dict:
+) -> IngestionResult:
     """
     Process/resume a document by its ID.
 
@@ -163,11 +156,11 @@ async def process_document_by_id_async(
 
 def process_document_by_id(
     doc_id: int,
-    collection_name: str = "buddhist_texts",
+    collection_name: Optional[str] = None,
     on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
     reprocess_mode: Optional[str] = None,
     clear_markdown: bool = False,
-) -> dict:
+) -> IngestionResult:
     """Synchronous wrapper for async document processing."""
     return asyncio.run(
         process_document_by_id_async(

@@ -160,11 +160,38 @@ def nikaya_tags(uid: str) -> dict:
     return result
 
 
+_session = None
+
+
+def _http_session():
+    """One shared HTTP session: reused connections, retries on transient failures.
+
+    SuttaCentral's API has had stretches of 502s under load. urllib3 retries
+    connection errors and 429/5xx responses up to 3 times with backoff
+    (1 s, 2 s, 4 s), honouring Retry-After, before the pipeline sees a failure.
+    """
+    global _session
+    if _session is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+        )
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(max_retries=retry))
+        session.headers["User-Agent"] = "meditation-db-ingest/0.1"
+        _session = session
+    return _session
+
+
 def _default_fetch_json(url: str) -> dict:
     """Real HTTP fetcher for the SuttaCentral API (exercised in live runs, not unit tests)."""
-    import requests
-
-    response = requests.get(url, timeout=30, headers={"User-Agent": "meditation-db-ingest/0.1"})
+    response = _http_session().get(url, timeout=30)
     response.raise_for_status()
     return response.json()
 

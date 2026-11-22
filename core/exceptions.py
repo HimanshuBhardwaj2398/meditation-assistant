@@ -90,6 +90,29 @@ class EmbeddingError(PipelineError):
     pass
 
 
+class DocumentBusyError(PipelineError):
+    """
+    Raised when another run holds a live processing claim on the document.
+
+    The claim lapses when its run stops writing status for longer than the
+    configured lease (INGESTION_LEASE_SECONDS), so retrying later succeeds
+    once that run finishes or dies.
+    """
+
+    pass
+
+
+class ProcessingLeaseLostError(PipelineError):
+    """
+    Raised when a run discovers another run has taken over its document.
+
+    The run stops without writing anything: the document now belongs to the
+    run that took it over.
+    """
+
+    pass
+
+
 # ============================================================================
 # DATABASE ERRORS
 # ============================================================================

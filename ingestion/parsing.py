@@ -8,7 +8,6 @@ ParserFactory automatically selects the appropriate parser based on source type.
 import logging
 import os
 import re
-import warnings
 from typing import Optional
 
 import requests
@@ -239,68 +238,3 @@ class ParserFactory:
         """
         parser = self.get_parser(source)
         return parser.parse(source)
-
-
-# ============================================================================
-# BACKWARD COMPATIBILITY (DEPRECATED)
-# ============================================================================
-
-
-def html_to_markdown(url: str) -> str | None:
-    """
-    Convert HTML content from a given URL to Markdown format.
-
-    **DEPRECATED**: Use ParserFactory.parse() instead.
-
-    Args:
-        url: HTTP or HTTPS URL
-
-    Returns:
-        Markdown string or None if parsing fails
-
-    Example (new API):
-        factory = ParserFactory()
-        result = factory.parse("https://example.com")
-        markdown = result.content
-    """
-    warnings.warn(
-        "html_to_markdown() is deprecated. Use ParserFactory.parse() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    try:
-        result = URLParser().parse(url)
-        return result.content
-    except ParsingError as e:
-        logger.error(f"html_to_markdown failed: {e}")
-        return None
-
-
-def parse_pdf(file_path: str) -> str | None:
-    """
-    Parse a PDF file using LlamaParse and return its content as markdown.
-
-    **DEPRECATED**: Use ParserFactory.parse() instead.
-
-    Args:
-        file_path: Path to PDF file
-
-    Returns:
-        Markdown string or None if parsing fails
-
-    Example (new API):
-        factory = ParserFactory()
-        result = factory.parse("document.pdf")
-        markdown = result.content
-    """
-    warnings.warn(
-        "parse_pdf() is deprecated. Use ParserFactory.parse() instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    try:
-        result = PDFParser().parse(file_path)
-        return result.content
-    except (ParsingError, ConfigurationError) as e:
-        logger.error(f"parse_pdf failed: {e}")
-        return None

@@ -22,8 +22,10 @@ def hermetic_settings(monkeypatch, tmp_path):
     """
     monkeypatch.chdir(tmp_path)
     get_settings.cache_clear()
+    get_orchestrator.cache_clear()
     yield
     get_settings.cache_clear()
+    get_orchestrator.cache_clear()
 
 
 def test_vector_store_config_falls_back_to_settings_url(monkeypatch, hermetic_settings):
@@ -77,3 +79,34 @@ def test_collection_service_url_resolves_through_settings(monkeypatch, hermetic_
     service = CollectionService()
 
     assert service.db_url == "postgresql://u:p@localhost/cs"
+
+
+def test_ingestion_vector_config_matches_retrieval_settings(monkeypatch, hermetic_settings):
+    """Stored vectors and query vectors must come from the same configured model.
+
+    Retrieval embeds questions with EMBEDDING_VOYAGE_MODEL; ingestion used to
+    hard-code voyage-3.5, so changing the setting silently mixed two models.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/ing")
+    monkeypatch.setenv("VECTOR_COLLECTION_NAME", "custom_coll")
+    monkeypatch.setenv("EMBEDDING_VOYAGE_MODEL", "voyage-custom")
+    monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "7")
+
+    from retrieval.query import RetrievalEngine
+
+    config = VectorStoreConfig()
+    engine = RetrievalEngine()
+
+    assert config.model_name == engine._embedding_model == "voyage-custom"
+    assert config.collection_name == engine._collection_name == "custom_coll"
+    assert config.batch_size == 7
+
+
+def test_ingestion_services_default_collection_from_settings(monkeypatch, hermetic_settings):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/svc")
+    monkeypatch.setenv("VECTOR_COLLECTION_NAME", "custom_coll")
+
+    from services.collection_service import CollectionService
+
+    assert get_orchestrator().vector_store_config.collection_name == "custom_coll"
+    assert CollectionService().collection_name == "custom_coll"

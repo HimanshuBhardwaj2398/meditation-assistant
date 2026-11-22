@@ -7,9 +7,10 @@ store manager raised the embed one, so the specific handler never fired.
 These tests pin the unification.
 """
 
+import pytest
 from langchain.schema import Document
 
-from core.interfaces import PipelineContext, StageStatus
+from core.interfaces import PipelineContext, PipelineStage, StageStatus
 from ingestion.stages import EmbeddingStage
 
 
@@ -34,15 +35,12 @@ def test_database_connection_error_is_a_vector_store_error():
     assert issubclass(DatabaseConnectionError, VectorStoreError)
 
 
-async def test_embedding_stage_specific_handler_catches_manager_errors():
-    """Manager failures must hit the specific except branch, not the generic one.
-
-    The generic branch prefixes messages with 'Unexpected error:'; the
-    specific branch records the message verbatim.
-    """
+async def test_embedding_stage_lets_manager_errors_through():
+    """The manager's EmbeddingError is core's class, so it reaches the pipeline intact."""
+    from core.exceptions import EmbeddingError as CoreEmbeddingError
 
     class ExplodingManager:
-        def embed_documents(self, documents):
+        def compute_embeddings(self, documents):
             from ingestion.embed import EmbeddingError
 
             raise EmbeddingError("vector store down")
@@ -50,7 +48,38 @@ async def test_embedding_stage_specific_handler_catches_manager_errors():
     stage = EmbeddingStage(ExplodingManager())
     context = PipelineContext(chunks=[Document(page_content="x", metadata={})])
 
-    result = await stage.execute(context)
+    with pytest.raises(CoreEmbeddingError, match="vector store down"):
+        await stage.execute(context)
+
+
+async def test_pipeline_keeps_domain_messages_and_names_unexpected_errors():
+    """A MeditationDBError is recorded verbatim; anything else with its type."""
+    from core.exceptions import EmbeddingError
+    from ingestion.orchestrator import PipelineOrchestrator
+
+    class RaisingStage(PipelineStage):
+        def __init__(self, stage_name, error):
+            self._name = stage_name
+            self._error = error
+
+        @property
+        def name(self):
+            return self._name
+
+        async def execute(self, context):
+            raise self._error
+
+    pipeline = PipelineOrchestrator(
+        [
+            RaisingStage("embedding", EmbeddingError("vector store down")),
+            RaisingStage("other", ValueError("boom")),
+        ]
+    )
+
+    result = await pipeline.execute(PipelineContext())
 
     assert result.stage_results["embedding"] == StageStatus.FAILED
-    assert result.error_messages["embedding"] == "vector store down"
+    assert result.error_messages == {
+        "embedding": "vector store down",
+        "other": "Unexpected ValueError: boom",
+    }

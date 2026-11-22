@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch-ingest SuttaCentral suttas into Neon (skips already-ingested sources).
+"""Batch-ingest SuttaCentral suttas into Neon (completed sources are skipped, failed ones resume).
 
 Composition root: points the app DB + vector store at NEON_DIRECT_URL via the
 injectable Database, ensures schema, then ingests each source through the
@@ -23,8 +23,8 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(_PROJECT_ROOT / ".env")
 
 from config.settings import DatabaseSettings, get_settings  # noqa: E402
-from db.crud import DocumentCRUD  # noqa: E402
-from db.database import Database, session_scope, set_default_database  # noqa: E402
+from core.exceptions import DocumentBusyError  # noqa: E402
+from db.database import Database, set_default_database  # noqa: E402
 from ingestion.embed import VectorStoreConfig  # noqa: E402
 from ingestion.orchestrator import IngestionOrchestrator  # noqa: E402
 
@@ -33,20 +33,31 @@ def _default_sources() -> list[str]:
     return [f"sc:mn{i}/sujato" for i in range(1, 6)]
 
 
-async def _ingest_all(sources: list[str], collection: str, neon_url: str) -> None:
+async def _ingest_all(sources: list[str], collection: str, neon_url: str) -> bool:
     orchestrator = IngestionOrchestrator(
         vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url)
     )
+    success = True
     for source in sources:
-        with session_scope() as session:
-            if DocumentCRUD(session).check_duplicate(source):
-                print(f"skip (already ingested): {source}")
-                continue
-        result = await orchestrator.process(source)
+        # Admission decides: new sources run, completed ones are skipped,
+        # and ones that failed before resume.
+        try:
+            result = await orchestrator.process(source)
+        except DocumentBusyError as e:
+            print(f"skip (another run is processing it): {source}: {e}")
+            success = False
+            continue
+        if result.get("already_completed"):
+            print(f"skip (already ingested): {source} doc={result['document_id']}")
+            continue
         print(
             f"ingested {source}: doc={result['document_id']} "
             f"chunks={result['chunk_count']} success={result['success']}"
         )
+        success = bool(result["success"]) and success
+        if result.get("errors"):
+            print(f"errors: {result['errors']}")
+    return success
 
 
 def main(argv: list[str]) -> None:
@@ -61,7 +72,8 @@ def main(argv: list[str]) -> None:
 
     collection = get_settings().vector.collection_name
     print(f"Batch-ingesting {len(sources)} source(s) into {collection!r} ...")
-    asyncio.run(_ingest_all(sources, collection, neon_url))
+    if not asyncio.run(_ingest_all(sources, collection, neon_url)):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

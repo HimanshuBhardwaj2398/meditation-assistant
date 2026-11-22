@@ -35,7 +35,6 @@ Examples:
 import argparse
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -90,6 +89,8 @@ def print_results(result: dict, verbose: bool = True):
     print(f"Title: {result['title']}")
     print(f"Chunks: {result['chunk_count']}")
     print(f"Status: {'✓ SUCCESS' if result['success'] else '✗ FAILED'}")
+    if result.get("already_completed"):
+        print("Already in the corpus; nothing was processed (use --reprocess to rebuild it).")
 
     # Stage results
     if verbose:
@@ -148,14 +149,7 @@ async def ingest_document(
             raise ValueError("reprocess_mode can only be used with an existing document ID")
 
         if verbose:
-            # Extract title from filename if not provided
-            if not title:
-                if source.startswith(("http://", "https://")):
-                    title = f"Web: {source[:50]}..."
-                else:
-                    title = Path(source).stem
-
-            print_document_info(0, source, title)
+            print_document_info(0, source, title or Path(source).stem)
             print("\nStarting ingestion pipeline...\n")
 
         result = await orchestrator.process(source=source, title=title)
@@ -170,7 +164,7 @@ async def ingest_batch(
     sources: List[str],
     titles: Optional[List[str]] = None,
     verbose: bool = True,
-    collection_name: str = "meditation_chunks",
+    collection_name: Optional[str] = None,
     reprocess_mode: Optional[str] = None,
     clear_markdown: bool = False,
 ) -> List[dict]:
@@ -181,24 +175,28 @@ async def ingest_batch(
         sources: List of URLs, file paths, or document IDs
         titles: Optional list of custom titles (must match sources length)
         verbose: Print detailed progress
-        collection_name: Name of the collection to store embeddings in
+        collection_name: Collection for new documents' embeddings; None means the
+            configured default (VECTOR_COLLECTION_NAME). An existing document
+            keeps its own collection.
         reprocess_mode: Optional mode for reprocessing existing docs
         clear_markdown: Clear stored markdown before reprocessing (full mode only)
 
     Returns:
         List of result dictionaries
     """
-    db_url = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+    if titles is not None and len(titles) != len(sources):
+        raise ValueError("titles must contain exactly one entry per source")
 
-    orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(
-            collection_name=collection_name,
-            db_url=db_url,
-        )
+    # The database URL comes from settings (DB_URL), the same as session_scope's.
+    config = (
+        VectorStoreConfig(collection_name=collection_name)
+        if collection_name
+        else VectorStoreConfig()
     )
+    orchestrator = IngestionOrchestrator(vector_store_config=config)
 
     results = []
-    titles = titles or [None] * len(sources)
+    titles = titles if titles is not None else [None] * len(sources)
 
     for i, (source, title) in enumerate(zip(sources, titles)):
         if len(sources) > 1:
@@ -294,7 +292,7 @@ def main():
         "sources", nargs="*", help="URL(s), PDF path(s), or document ID(s) to ingest"
     )
 
-    parser.add_argument("--title", "-t", help="Custom title for the document")
+    parser.add_argument("--title", "-t", help="Custom title applied to each supplied document")
 
     parser.add_argument(
         "--resume", "-r", type=int, help="Resume ingestion for a specific document ID"
@@ -330,8 +328,11 @@ def main():
     parser.add_argument(
         "--collection",
         "-c",
-        default="meditation_chunks",
-        help="Collection name for storing embeddings (default: meditation_chunks)",
+        default=None,
+        help=(
+            "Collection for new documents' embeddings (default: VECTOR_COLLECTION_NAME, "
+            "normally buddhist_texts); existing documents keep their own"
+        ),
     )
 
     args = parser.parse_args()
@@ -391,7 +392,7 @@ def main():
         results = asyncio.run(
             ingest_batch(
                 args.sources,
-                titles=[args.title] if args.title else None,
+                titles=[args.title] * len(args.sources) if args.title else None,
                 verbose=not args.quiet,
                 collection_name=args.collection,
             )

@@ -57,9 +57,13 @@ def main(argv: list[str]) -> None:
     print(f"title       : {result['title']}")
     print(f"chunk_count : {result['chunk_count']}")
     print(f"success     : {result['success']}")
+    if result.get("already_completed"):
+        print("note        : already in the corpus; nothing was processed")
     print(f"stages      : {result['stage_results']}")
     if result.get("errors"):
         print(f"errors      : {result['errors']}")
+    if not result["success"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

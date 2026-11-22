@@ -254,3 +254,16 @@ def test_parse_includes_nikaya_tags_in_metadata():
     assert result.metadata["nikaya"] == "mn"
     assert result.metadata["nikaya_name"] == "majjhima_nikaya"
     assert "majjhima_nikaya" in result.metadata["tags"]
+
+
+def test_suttacentral_fetches_share_a_retrying_session():
+    """Transient 502s and dropped connections are retried before a stage fails."""
+    from ingestion import suttacentral
+
+    session = suttacentral._http_session()
+    retry = session.get_adapter("https://suttacentral.net/api/").max_retries
+
+    assert suttacentral._http_session() is session
+    assert retry.total == 3
+    assert {429, 502, 503, 504} <= set(retry.status_forcelist)
+    assert retry.respect_retry_after_header

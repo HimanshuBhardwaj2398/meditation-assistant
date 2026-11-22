@@ -53,7 +53,7 @@ flowchart LR
 | [`views/`](../views/) | Streamlit pages, wired by [`app.py`](../app.py) | `ingest`, `queue`, `browse`, `document_detail`, `stats`, `validation`, `rag_playground` |
 | [`observability/`](../observability/) | Optional tracing | [`langfuse.py`](../observability/langfuse.py): `LangfuseTracer`, `get_langfuse_tracer` — no-ops unless keys are configured |
 | [`core/`](../core/) | Contracts shared by all layers | [`interfaces.py`](../core/interfaces.py): `Parser` protocol, `PipelineStage` ABC, frozen `PipelineContext` · [`exceptions.py`](../core/exceptions.py): `MeditationDBError` hierarchy |
-| [`config/`](../config/) | Pydantic Settings | [`settings.py`](../config/settings.py): nested `Settings` (database, embedding, parsing, chunking, langfuse, vector). The designated config boundary (design doc [D4](plans/2026-07-10-architecture-hardening-retrieval-foundations-design.md)): ingestion-side env fallbacks route through settings, pinned by [`tests/test_config_boundary.py`](../tests/test_config_boundary.py); a few direct `os.getenv` reads remain in [`retrieval/`](../retrieval/) and [`collection_service.py`](../services/collection_service.py) |
+| [`config/`](../config/) | Pydantic Settings | [`settings.py`](../config/settings.py): nested `Settings` (database, embedding, parsing, chunking, ingestion, langfuse, vector). The designated config boundary (design doc [D4](plans/2026-07-10-architecture-hardening-retrieval-foundations-design.md)): ingestion-side env fallbacks route through settings, pinned by [`tests/test_config_boundary.py`](../tests/test_config_boundary.py); outside `config/` and the CLI scripts nothing reads the environment directly (ruff rule TID251) |
 | [`scripts/`](../scripts/) | Operational CLIs | [`ingest_one.py`](../scripts/ingest_one.py), [`ingest_batch.py`](../scripts/ingest_batch.py), [`build_catalog.py`](../scripts/build_catalog.py), [`ingest.py`](../scripts/ingest.py), [`rebuild_toc.py`](../scripts/rebuild_toc.py), [`validate_chunk_toc_integrity.py`](../scripts/validate_chunk_toc_integrity.py), [`verify_database.py`](../scripts/verify_database.py), [`check_doc_links.py`](../scripts/check_doc_links.py) |
 | [`alembic/`](../alembic/) | Schema migrations | `alembic upgrade head` creates the initial documents/chunks schema |
 
@@ -72,31 +72,54 @@ dependencies, defined in [`ingestion/stages.py`](../ingestion/stages.py):
    then merges undersized fragments (details under
    [design decisions](#chunk-sizing-headers-first-semantic-boundaries-where-headers-run-out)).
 3. **`EmbeddingStage`** (requires chunking) — assigns each chunk a UUID (also
-   used as the PGVector row ID), tags it with `document_id` and source/nikāya
-   metadata, and batch-embeds via [`VectorStoreManager`](../ingestion/embed.py).
-   It then verifies the vector store returned exactly the assigned UUIDs — any
-   count or set mismatch fails the stage rather than silently desyncing the
-   two stores.
+   stored as PGVector's `custom_id`), tags it with `document_id` and source/nikāya
+   metadata, and computes vectors in batches via
+   [`VectorStoreManager`](../ingestion/embed.py). The vectors stay in memory
+   until publication.
 4. **`DatabasePersistenceStage`** (requires embedding) — inside one
-   `session_scope`, writes the chunk rows, builds a table of contents from the
-   chunks' header paths into `doc_metadata`, marks the document `COMPLETED`,
-   and clears the temporary chunk staging column.
+   `session_scope`, writes the vector and chunk rows, builds the table of
+   contents in `doc_metadata`, marks the document `COMPLETED`, and clears the
+   temporary chunk staging column. A write failure rolls back both sets of rows.
+   The application and vector store must use the same database URL.
 
 **Orchestration.** [`PipelineOrchestrator`](../ingestion/orchestrator.py)
 validates at construction that the stage graph has no cycles (DFS with a
 recursion stack), then computes execution order with a topological sort. At
 run time it skips stages already `COMPLETED` in the context, refuses stages
 whose dependencies didn't complete, and keeps going after a failure so
-independent work still runs; failures are recorded per-stage in the context
-and the document is marked `FAILED`.
+independent work still runs. Stages raise when they cannot finish; the
+orchestrator is the one place that records the failure, keeping a
+`MeditationDBError`'s message as-is and prefixing anything else with its
+exception type. `IngestionOrchestrator` then marks the document `FAILED`.
+Stage transitions reach `documents.status` through
+[`StatusRecorder`](../ingestion/status.py), which writes only real changes (each
+write is a round trip to Neon): a clean run shows PARSING (set by the claim),
+CHUNKING, EMBEDDING, then COMPLETED.
 
-**Idempotency and resume.** The frozen
-[`PipelineContext`](../core/interfaces.py) carries `stage_results`, so re-runs
-skip finished work. `IngestionOrchestrator.process()` accepts a document ID to
-resume a stuck document, and a `ReprocessMode` (`FULL`, `FROM_CHUNKING`,
-`FROM_EMBEDDING`) that seeds completed stages from stored markdown or chunk
-rows — after first deleting the stale embeddings (by UUID) and chunk rows so
-reprocessing can't leave orphans.
+**Admission, resume and reprocess.** A submitted source goes through
+[`admit()`](../ingestion/admission.py) first. Sources are compared in canonical
+form (`sc:<uid>/<author>`), so a SuttaCentral ref and its reading URL are one
+document. A new source gets a `PENDING` row (one `INSERT ... ON CONFLICT DO
+NOTHING`). A `COMPLETED` one is not processed again: the result reports it with
+`already_completed`. One that never completed is resumed. The frozen
+[`PipelineContext`](../core/interfaces.py) carries `stage_results`, so a resume
+skips parsing when an earlier attempt stored the markdown. A `ReprocessMode`
+(`FULL`, `FROM_CHUNKING`, `FROM_EMBEDDING`) seeds the stages it reuses from
+stored markdown or chunk rows; `FROM_EMBEDDING` keeps the chunks' UUIDs. A
+reprocess is a replacement: the publish transaction deletes the document's old
+chunk rows and vectors (by chunk UUID, and by `cmetadata->>'document_id'` to
+catch vectors older runs left without chunk rows) and writes the new ones. If
+the reprocess fails, the old version stays published and the document returns
+to `COMPLETED`.
+
+**One run per document.** A run claims a document by setting
+`documents.processing_token`, which succeeds only while no run holds a live
+claim. Every status write is fenced by the token and refreshes `updated_at`, so
+a claim lapses only after its run stops writing for `INGESTION_LEASE_SECONDS`
+(default 30 minutes), and another run may then take the document over. The
+publish transaction checks the token under a row lock (`FOR UPDATE`), so a run
+that lost its claim cannot publish. A second run on a busy document gets
+`DocumentBusyError`.
 
 **Status flow.** `DocumentStatus` in [`db/schema.py`](../db/schema.py):
 `PENDING → PARSING → PARSED → CHUNKING → CHUNKED → EMBEDDING → COMPLETED`,
@@ -171,7 +194,16 @@ LangChain-managed vector table:
 Embeddings are partitioned into PGVector **collections** by source type. The
 default is `buddhist_texts` ([`VectorSettings.collection_name`](../config/settings.py),
 `VECTOR_COLLECTION_NAME` env var); ingestion CLIs and services accept a
-collection argument to route a source elsewhere (e.g. `talks`).
+collection argument to route a *new* source elsewhere (e.g. `talks`). A
+document keeps its collection: admission records it in
+`doc_metadata.vector_collection`, and every retry and reprocess publishes there,
+whatever the caller is configured for. A document from before that was recorded
+inherits the collection its vectors are in. Deleting a document
+(`CollectionService.delete_document_complete`, used by the Browse and Queue
+pages) removes the row, its chunks and all its vectors in one transaction.
+`scripts/verify_database.py --consistency-only` checks, read-only, that chunk
+rows and vectors still match one to one; `--delete-orphan-vectors` shows (and
+with `--apply` deletes) pipeline vectors whose chunk row is gone.
 
 ## Design decisions
 
@@ -183,8 +215,8 @@ Instead of forcing application metadata into that table, the relational side
 tracking, JSONB metadata, migrations — and joins to the vector side by UUID.
 The vector layer stays swappable (the community `PGVector` class is already
 deprecated upstream) without touching application data. The cost is a
-cross-store consistency obligation, paid deliberately: `EmbeddingStage`'s ID
-verification, the validation UI page, and
+cross-store consistency obligation, addressed by the shared transaction for
+publication, the validation UI page, and
 [`scripts/verify_database.py`](../scripts/verify_database.py).
 
 ### Callers own transactions

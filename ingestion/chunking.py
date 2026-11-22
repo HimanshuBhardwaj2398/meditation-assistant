@@ -7,9 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from langchain.schema import Document
 from langchain.text_splitter import MarkdownHeaderTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
 
 from core.exceptions import ChunkingError

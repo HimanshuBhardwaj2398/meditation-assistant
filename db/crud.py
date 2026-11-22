@@ -5,9 +5,11 @@ surface early) but never commit — the enclosing ``session_scope`` owns the
 transaction, so multi-step operations stay atomic.
 """
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import text
+from sqlalchemy import func, or_, text
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
 from . import schema
@@ -115,6 +117,141 @@ class DocumentCRUD:
             doc.status_details = status_details
             self.db.flush()
         return doc
+
+    def insert_if_absent(
+        self,
+        file_path: str,
+        title: str,
+        description: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        doc_metadata: Optional[Dict] = None,
+    ) -> Optional[int]:
+        """
+        Insert a PENDING document unless one with this file_path exists.
+
+        A single INSERT ... ON CONFLICT DO NOTHING, so two callers admitting
+        the same source can never both insert, and neither gets an
+        IntegrityError that would abort its transaction.
+
+        Returns:
+            The new document's id, or None when the source was already there
+        """
+        dialect = self.db.get_bind().dialect.name
+        insert = sqlite.insert if dialect == "sqlite" else postgresql.insert
+        statement = (
+            insert(schema.Document)
+            .values(
+                title=title,
+                file_path=file_path,
+                description=description,
+                tags=tags or [],
+                doc_metadata=doc_metadata or {},
+                status=schema.DocumentStatus.PENDING,
+            )
+            .on_conflict_do_nothing(index_elements=["file_path"])
+            .returning(schema.Document.id)
+        )
+        return self.db.execute(statement).scalar_one_or_none()
+
+    def claim_for_processing(
+        self,
+        document_id: int,
+        token: str,
+        stale_before: datetime,
+        status: Optional[schema.DocumentStatus] = None,
+        status_details: Optional[str] = None,
+    ) -> bool:
+        """
+        Take a document's processing claim if no live run holds it.
+
+        A claim is live while processing_token is set and the row was written
+        after stale_before. Each status write by the owning run refreshes
+        updated_at, so a claim lapses only once its run stops writing.
+
+        Args:
+            status: Also set the run's starting status, in the same UPDATE
+
+        Returns:
+            True if this call took the claim
+        """
+        claimed = (
+            self.db.query(schema.Document)
+            .filter(
+                schema.Document.id == document_id,
+                or_(
+                    schema.Document.processing_token.is_(None),
+                    schema.Document.updated_at < stale_before,
+                ),
+            )
+            .update(
+                {
+                    schema.Document.processing_token: token,
+                    schema.Document.updated_at: func.now(),
+                    **(
+                        {
+                            schema.Document.status: status,
+                            schema.Document.status_details: status_details,
+                        }
+                        if status is not None
+                        else {}
+                    ),
+                },
+                synchronize_session=False,
+            )
+        )
+        return claimed == 1
+
+    def set_status_if_owner(
+        self,
+        document_id: int,
+        token: str,
+        status: schema.DocumentStatus,
+        status_details: Optional[str] = None,
+        release: bool = False,
+    ) -> bool:
+        """
+        Write a run's status only while that run still holds the claim.
+
+        One UPDATE, no read first. It also refreshes updated_at, which keeps
+        the claim alive.
+
+        Args:
+            release: Also drop the claim (the run is finished)
+
+        Returns:
+            False if another run has taken the document over
+        """
+        values: Dict[Any, Any] = {
+            schema.Document.status: status,
+            schema.Document.status_details: status_details,
+            schema.Document.updated_at: func.now(),
+        }
+        if release:
+            values[schema.Document.processing_token] = None
+        updated = (
+            self.db.query(schema.Document)
+            .filter(
+                schema.Document.id == document_id,
+                schema.Document.processing_token == token,
+            )
+            .update(values, synchronize_session=False)
+        )
+        return updated == 1
+
+    def get_document_for_update(self, document_id: int) -> Optional[schema.Document]:
+        """
+        Load a document and lock its row until the transaction ends.
+
+        Publishing reads the claim token through this lock, so a run that
+        takes the document over cannot slip in between the check and the
+        writes. (SQLite, used in tests, has no row locks and ignores it.)
+        """
+        return (
+            self.db.query(schema.Document)
+            .filter(schema.Document.id == document_id)
+            .with_for_update()
+            .first()
+        )
 
     def update_markdown(
         self,
@@ -312,6 +449,14 @@ class ChunkCRUD:
             .filter(schema.Chunk.document_id == document_id)
             .order_by(schema.Chunk.chunk_index)
             .all()
+        )
+
+    def count_chunks_by_document(self, document_id: int) -> int:
+        """Number of chunk rows a document has."""
+        return (
+            self.db.query(func.count(schema.Chunk.id))
+            .filter(schema.Chunk.document_id == document_id)
+            .scalar()
         )
 
     def get_chunk_by_uuid(

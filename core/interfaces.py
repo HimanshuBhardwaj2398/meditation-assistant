@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
 
-from langchain.schema import Document as LangchainDocument
+from langchain_core.documents import Document as LangchainDocument
 
 # ============================================================================
 # PARSING INTERFACES
@@ -121,6 +121,15 @@ class PipelineContext:
     # Pipeline execution state
     stage_results: Dict[str, StageStatus] = field(default_factory=dict)
     error_messages: Dict[str, str] = field(default_factory=dict)
+
+    # Vectors computed for chunks, in the same order.
+    vectors: List[List[float]] = field(default_factory=list)
+
+    # The claim this run holds on the document; publishing checks it.
+    processing_token: Optional[str] = None
+
+    # The vector collection the document belongs to; publishing writes there.
+    vector_collection: Optional[str] = None
 
     def with_update(self, **kwargs) -> "PipelineContext":
         """

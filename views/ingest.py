@@ -10,7 +10,6 @@ from pathlib import Path
 
 import streamlit as st
 
-from core.exceptions import DuplicateDocumentError
 from core.interfaces import StageStatus
 from db.crud import get_all_collections
 from db.database import session_scope
@@ -212,14 +211,12 @@ def render():
                     # Clear collections cache so new collection appears
                     st.session_state.pop("collections_cache", None)
 
-                    if result.get("success"):
+                    if result.get("already_completed"):
+                        status_container.update(label="Already in the corpus", state="complete")
+                    elif result.get("success"):
                         status_container.update(label="Processing complete!", state="complete")
                     else:
                         status_container.update(label="Processing failed", state="error")
-                except DuplicateDocumentError as e:
-                    status_container.update(label="Duplicate document", state="error")
-                    st.error("Duplicate Document Detected")
-                    st.warning(str(e))
                 except Exception as e:
                     status_container.update(label="Processing failed", state="error")
                     st.error(f"Ingestion failed: {str(e)}")
@@ -231,7 +228,13 @@ def render():
         st.markdown("---")
         st.subheader("Ingestion Results")
 
-        if result.get("success"):
+        if result.get("already_completed"):
+            st.info(
+                f"Already in the corpus as document {result.get('document_id')} "
+                f"({result.get('chunk_count')} chunks); nothing was processed. "
+                "Use Reprocess on the Browse page to rebuild it."
+            )
+        elif result.get("success"):
             st.success("Document successfully ingested!")
 
             col1, col2, col3 = st.columns(3)

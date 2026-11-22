@@ -4,6 +4,7 @@ import pytest
 from langchain.schema import Document
 
 from ingestion.chunking import Config, MarkdownChunker
+from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.stages import DatabasePersistenceStage
 
 
@@ -135,7 +136,9 @@ class TestBuildTableOfContents:
     """Tests for TOC builder with new metadata format."""
 
     def setup_method(self):
-        self.stage = DatabasePersistenceStage()
+        self.stage = DatabasePersistenceStage(
+            VectorStoreManager(VectorStoreConfig(db_url="postgresql://test/test"))
+        )
 
     def test_single_path_chunks(self):
         chunks = [
