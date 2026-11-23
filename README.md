@@ -21,7 +21,7 @@ flowchart LR
         PDF[PDFs via LlamaParse]
         URL[Web pages]
     end
-    subgraph pipeline [Ingestion pipeline — DAG of idempotent stages]
+    subgraph pipeline [Ingestion pipeline]
         P[Parsing<br/>strategy-selected parser] --> C[Semantic chunking<br/>bge-small boundary detection]
         C --> E[Embedding<br/>Voyage voyage-3.5]
         E --> D[Persistence]
@@ -32,7 +32,8 @@ flowchart LR
         V[(pgvector embeddings)]
         M <-. UUID link .-> V
     end
-    D --> M & V
+    P --> M
+    D --> V & M
     subgraph query [Query layer]
         R[RetrievalEngine<br/>similarity · MMR · threshold · hybrid]
         A[Grounded answering<br/>with citations]
@@ -59,9 +60,9 @@ flowchart LR
   entire Nikāyas and a batch CLI ingests them with duplicate skipping.
   → [design doc](docs/plans/2026-07-10-suttacentral-ingestion-design.md) ·
   [ingestion/suttacentral.py](ingestion/suttacentral.py)
-- **DAG ingestion pipeline** — four idempotent stages (parse → chunk → embed →
-  persist) with dependency resolution; failed ingestions resume from where
-  they stopped. → [ingestion/stages.py](ingestion/stages.py)
+- **Ingestion pipeline** — four stages parse, chunk, embed and persist each text.
+  Explicit reprocessing modes can reuse saved Markdown or chunk rows.
+  → [Ingestion code architecture, atomic publication and recovery](docs/INGESTION_ARCHITECTURE.md)
 - **Dual-store integrity** — relational metadata and vector rows linked by
   UUID, with integrity enforced by tests, a validation UI page, and CLI
   verification scripts. → [db/schema.py](db/schema.py)

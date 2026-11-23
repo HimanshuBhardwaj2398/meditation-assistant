@@ -7,7 +7,7 @@ Code links point at the symbols they describe.
 ## System overview
 
 A document enters as a SuttaCentral reference, a PDF, or a URL. A DAG of four
-idempotent pipeline stages parses it to markdown, chunks it along semantic
+pipeline stages parses it to markdown, chunks it along semantic
 boundaries, embeds the chunks with Voyage `voyage-3.5`, and persists chunk
 metadata. Everything lands in a single Postgres database (Neon) that holds both
 the relational tables and the pgvector embeddings, linked row-for-row by UUID.
@@ -22,7 +22,7 @@ flowchart LR
         PDF[PDFs via LlamaParse]
         URL[Web pages]
     end
-    subgraph pipeline [Ingestion pipeline — DAG of idempotent stages]
+    subgraph pipeline [Ingestion pipeline]
         P[Parsing<br/>strategy-selected parser] --> C[Semantic chunking<br/>bge-small boundary detection]
         C --> E[Embedding<br/>Voyage voyage-3.5]
         E --> D[Persistence]
@@ -33,7 +33,8 @@ flowchart LR
         V[(pgvector embeddings)]
         M <-. UUID link .-> V
     end
-    D --> M & V
+    P --> M
+    D --> V & M
     subgraph query [Query layer]
         R[RetrievalEngine<br/>similarity · MMR · threshold · hybrid]
         A[Grounded answering<br/>with citations]
@@ -58,6 +59,15 @@ flowchart LR
 | [`alembic/`](../alembic/) | Schema migrations | `alembic upgrade head` creates the initial documents/chunks schema |
 
 ## Ingestion pipeline
+
+![Code architecture of source admission, claim ownership, stage dispatch and atomic publication](images/ingestion-architecture.png)
+
+[Ingestion architecture and design analysis](INGESTION_ARCHITECTURE.md) · [Full-size SVG](images/ingestion-architecture.svg) · [Editable draw.io diagrams](images/ingestion-architecture.drawio)
+
+The default pipeline checkpoints Markdown after parsing. Chunk text and computed
+vectors stay in memory until the publisher commits both sets of rows in one
+transaction. The detailed guide traces a source through those boundaries and
+examines recovery, concurrency and passage identity.
 
 Four stages, each a [`PipelineStage`](../core/interfaces.py) declaring its
 dependencies, defined in [`ingestion/stages.py`](../ingestion/stages.py):
@@ -114,6 +124,12 @@ catch vectors older runs left without chunk rows) and writes the new ones. If
 the reprocess fails, the old version stays published and the document returns
 to `COMPLETED`.
 
+| Mode | Starts at | Input for that stage |
+|------|-----------|----------------------|
+| `full` | Parsing | Original source |
+| `from_chunking` | Chunking | Saved document Markdown |
+| `from_embedding` | Embedding | Text and metadata from previously persisted chunk rows |
+
 **One run per document.** A run claims a document
 ([`claim_document`](../ingestion/claim.py)) by setting
 `documents.processing_token`, which succeeds only while no run holds a live
@@ -124,11 +140,11 @@ publish transaction checks the token under a row lock (`FOR UPDATE`), so a run
 that lost its claim cannot publish. A second run on a busy document gets
 `DocumentBusyError`.
 
-**Status flow.** `DocumentStatus` in [`db/schema.py`](../db/schema.py):
-`PENDING → PARSING → PARSED → CHUNKING → CHUNKED → EMBEDDING → COMPLETED`,
-with `FAILED` on any stage failure. There is deliberately no "persisting"
-state — the persistence stage reports under `EMBEDDING` until it flips the
-document to `COMPLETED`.
+**Status flow.** A fresh run records `PENDING → PARSING → CHUNKING → EMBEDDING → COMPLETED`.
+Publication runs under `EMBEDDING` until its transaction commits. A failed
+first publication ends `FAILED`. A failed replacement of a previously
+completed document restores `COMPLETED` with details of the failure.
+[StatusRecorder](../ingestion/status.py)
 
 ## Query path
 
@@ -192,7 +208,7 @@ LangChain-managed vector table:
   nikāya tags), `created_at`.
 - **`langchain_pg_embedding`** — owned by LangChain's PGVector.
   `EmbeddingStage` sets each LangChain `Document.id` to the chunk's UUID, so
-  the embedding row ID equals `chunks.uuid` exactly.
+  publication writes that value to `langchain_pg_embedding.custom_id`, which matches `chunks.uuid`.
 
 Embeddings are partitioned into PGVector **collections** by source type. The
 default is `buddhist_texts` ([`VectorSettings.collection_name`](../config/settings.py),
@@ -288,8 +304,8 @@ Twenty-three tracked test modules under [`tests/`](../tests/); external services
 ones and what they actually guarantee:
 
 - [`test_embedding_integrity.py`](../tests/test_embedding_integrity.py) — the
-  embedding stage fails loudly if the vector store returns IDs differing from
-  the assigned chunk UUIDs, so the UUID link can't silently drift.
+  embedding stage attaches UUIDs and provenance. Its vector-only mode also
+  verifies the IDs returned by the adapter.
 - [`test_crud_transaction_ownership.py`](../tests/test_crud_transaction_ownership.py)
   — CRUD methods never commit; multi-step persistence stays atomic.
 - [`test_pipeline_context_immutability.py`](../tests/test_pipeline_context_immutability.py)

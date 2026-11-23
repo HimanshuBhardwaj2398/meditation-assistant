@@ -5,6 +5,7 @@
 | Doc | Description |
 |-----|-------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, module map, and the reasoning behind key decisions |
+| [Ingestion architecture](INGESTION_ARCHITECTURE.md) | Code and process boundaries, a source trace, design tradeoffs and failure recovery |
 | [UI_GUIDE.md](UI_GUIDE.md) | CLI and Streamlit web UI walkthrough for ingesting and managing texts |
 | [ALEMBIC_CHEATSHEET.md](ALEMBIC_CHEATSHEET.md) | Alembic migration command reference |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |

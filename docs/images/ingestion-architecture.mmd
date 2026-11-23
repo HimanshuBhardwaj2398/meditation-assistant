@@ -1,0 +1,51 @@
+---
+config:
+  theme: base
+  themeVariables:
+    fontFamily: 'Arial, sans-serif'
+    fontSize: '16px'
+    primaryTextColor: '#183847'
+    lineColor: '#526971'
+    edgeLabelBackground: '#ffffff'
+    clusterBkg: '#f7faf9'
+    clusterBorder: '#c0cfca'
+  flowchart:
+    wrappingWidth: 290
+    padding: 12
+    nodeSpacing: 24
+    rankSpacing: 28
+    diagramPadding: 14
+    curve: linear
+---
+flowchart TB
+    accTitle: Ingestion code architecture
+    accDescr: CLI scripts and the Streamlit service call IngestionOrchestrator. It constructs a stage list and seeds PipelineContext. PipelineOrchestrator dispatches the four PipelineStage implementations in dependency order. Each stage owns a different collaborator.
+    UI["<b>Streamlit</b><br/>services/ingestion_service.py<br/>ingest_document_async()"]
+    CLI["<b>CLI or bulk worker</b><br/>scripts/ingest_one.py<br/>scripts/ingest_all.py"]
+    UI -->|document ID| IO
+    CLI -->|source| IO
+    IO["<b>IngestionOrchestrator.process()</b><br/>Admit → claim → seed PipelineContext<br/>_build_stages() wires the run."]
+    IO --> A["<b>admission.admit() · DocumentCRUD</b><br/>Canonical source and unique row<br/>claim_for_processing() takes the lease."]
+    IO -->|stages + context| RUN
+    RUN["<b>PipelineOrchestrator.execute()</b><br/>await PipelineStage.execute(ctx)<br/>in dependency order"]
+    IO -. wires callback .-> S["<b>StatusRecorder.record()</b><br/>set_status_if_owner() checks the token."]
+    %% Keep support components above the dispatcher so stage edges are unobstructed.
+    A ~~~ RUN
+    S ~~~ RUN
+    P["<b>ParsingStage</b><br/>source → parsed_content"]
+    C["<b>ChunkingStage</b><br/>Markdown → chunks"]
+    E["<b>EmbeddingStage</b><br/>chunks → vectors + IDs"]
+    W["<b>DatabasePersistenceStage</b><br/>context → published version"]
+    RUN --> P & C & E & W
+    P --> PF["<b>ParserFactory.parse()</b><br/>Parser protocol → ParseResult<br/>DocumentCRUD + session_scope"]
+    C --> MC["<b>MarkdownChunker.chunk()</b><br/>Heading splits and optional<br/>local semantic splitting"]
+    E --> VM["<b>VectorStoreManager</b><br/>compute_embeddings()<br/>Voyage batches → vectors in memory"]
+    W --> CRUD["<b>VectorStoreManager + CRUD</b><br/>stage_vectors() + chunk rows<br/>One guarded transaction"]
+    classDef client fill:#f4f7f8,stroke:#98acb2,color:#183847;
+    classDef owner fill:#193e48,stroke:#193e48,color:#ffffff;
+    classDef stage fill:#e8f3ef,stroke:#76a592,color:#153f34;
+    classDef dep fill:#edf2fb,stroke:#92a7c5,color:#203d5b;
+    class UI,CLI client;
+    class IO,RUN owner;
+    class P,C,E,W stage;
+    class PF,MC,VM,CRUD,A,S dep;
