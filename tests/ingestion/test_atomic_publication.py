@@ -11,6 +11,7 @@ from core.exceptions import DatabaseError, EmbeddingError
 from core.interfaces import ParseResult
 from db.crud import DocumentCRUD
 from ingestion import stages
+from ingestion.claim import ReprocessMode
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.orchestrator import IngestionOrchestrator
 
@@ -73,7 +74,7 @@ async def test_interrupted_ingestion_can_retry_without_orphan_vectors(
         )
 
     provider.fail_second = True
-    first_attempt = await orchestrator.process("sc:mn1/sujato")
+    first_attempt = await orchestrator.ingest("sc:mn1/sujato")
     assert first_attempt["success"] is False
     assert "provider interrupted" in first_attempt["errors"]["embedding"]
     document_id = first_attempt["document_id"]
@@ -90,13 +91,13 @@ async def test_interrupted_ingestion_can_retry_without_orphan_vectors(
     provider.fail_second = False
     with monkeypatch.context() as publication:
         publication.setattr(DocumentCRUD, "clear_chunks", interrupt_publication)
-        second_attempt = await orchestrator.process(document_id)
+        second_attempt = await orchestrator.resume(document_id)
     assert second_attempt["success"] is False
     assert second_attempt["errors"]["database_persistence"] == "publication interrupted"
     with db.session_scope() as session:
         assert row_counts(session) == (0, 0)
 
-    result = await orchestrator.process(document_id)
+    result = await orchestrator.resume(document_id)
     assert result["success"] is True, result["errors"]
     with db.session_scope() as session:
         assert row_counts(session) == (2, 2)
@@ -156,12 +157,12 @@ async def test_replacement_keeps_ids_sweeps_orphans_and_survives_failure(
     db = postgres_database
     orchestrator = _postgres_orchestrator(db, monkeypatch)
 
-    first = await orchestrator.process("sc:mn1/sujato")
+    first = await orchestrator.ingest("sc:mn1/sujato")
     assert first["success"] is True, first["errors"]
     document_id = first["document_id"]
 
     # Another spelling of the same text hits ON CONFLICT and reports the existing document.
-    again = await orchestrator.process("https://suttacentral.net/MN1/en/sujato")
+    again = await orchestrator.ingest("https://suttacentral.net/MN1/en/sujato")
     assert again["already_completed"] is True
     assert again["document_id"] == document_id
 
@@ -180,7 +181,7 @@ async def test_replacement_keeps_ids_sweeps_orphans_and_survives_failure(
     with db.session_scope() as session:
         before = [row[0] for row in _published(session) if row[0] is not None]
 
-    result = await orchestrator.process(document_id, reprocess_mode="from_embedding")
+    result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_EMBEDDING)
 
     assert result["success"] is True, result["errors"]
     with db.session_scope() as session:
@@ -193,7 +194,7 @@ async def test_replacement_keeps_ids_sweeps_orphans_and_survives_failure(
 
     with monkeypatch.context() as patch:
         patch.setattr(DocumentCRUD, "clear_chunks", interrupt)
-        failed = await orchestrator.process(document_id, reprocess_mode="from_chunking")
+        failed = await orchestrator.reprocess(document_id, ReprocessMode.FROM_CHUNKING)
 
     assert failed["success"] is False
     with db.session_scope() as session:
@@ -224,7 +225,7 @@ async def test_a_live_claim_blocks_a_second_run_until_it_lapses(postgres_databas
         )
 
     with pytest.raises(DocumentBusyError):
-        await orchestrator.process("sc:mn2/sujato")
+        await orchestrator.ingest("sc:mn2/sujato")
 
     with db.session_scope() as session:
         session.execute(
@@ -232,6 +233,6 @@ async def test_a_live_claim_blocks_a_second_run_until_it_lapses(postgres_databas
             {"id": admission.document_id},
         )
 
-    result = await orchestrator.process("sc:mn2/sujato")
+    result = await orchestrator.ingest("sc:mn2/sujato")
 
     assert result["success"] is True, result["errors"]

@@ -92,7 +92,7 @@ class Database:
             yield session
             session.commit()
         except Exception as exc:
-            logger.error(f"Session error: {exc}")
+            logger.error("Session error: %s", exc)
             session.rollback()
             raise
         finally:

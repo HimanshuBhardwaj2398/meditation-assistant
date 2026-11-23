@@ -1,19 +1,34 @@
-import asyncio
+"""Split a document's markdown into chunks for embedding.
+
+``MarkdownChunker.chunk`` runs four steps:
+
+1. Split on markdown headers, so each chunk starts inside one section.
+2. Split sections longer than ``max_size`` characters semantically, at the
+   sentence boundaries where a small local embedding model
+   (``ChunkingConfig.model``) sees the meaning shift.
+3. Merge chunks shorter than ``min_size`` into their neighbours, without
+   exceeding ``max_size``.
+4. Record each chunk's header paths, level map, title and sizes in its
+   metadata (``ingestion.toc`` builds the table of contents from these).
+
+All sizes are in characters.
+"""
+
 import logging
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from langchain.text_splitter import MarkdownHeaderTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
 
-from core.exceptions import ChunkingError
-from ingestion.markdown_utils import extract_first_h1
+from core.exceptions import ChunkingError, ConfigurationError
+from ingestion.markdown_utils import UNTITLED, extract_first_h1
 
 if TYPE_CHECKING:
     from config.settings import ChunkingSettings
@@ -22,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class Config:
-    """Chunker configuration."""
+class ChunkingConfig:
+    """Chunker configuration. Sizes are in characters."""
 
     max_size: int = 2000
     min_size: int = 700
@@ -34,17 +49,17 @@ class Config:
     tiny_chunk_threshold: int = 50
     model: str = "BAAI/bge-small-en-v1.5"
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.max_size <= self.min_size:
-            raise ValueError("max_size must be greater than min_size")
+            raise ConfigurationError("max_size must be greater than min_size")
 
     @classmethod
     def from_settings(
         cls,
         chunking: Optional["ChunkingSettings"] = None,
         model: Optional[str] = None,
-    ) -> "Config":
-        """Build a Config from env-driven settings (CHUNKING_* / EMBEDDING_*).
+    ) -> "ChunkingConfig":
+        """Build a ChunkingConfig from env-driven settings (CHUNKING_* / EMBEDDING_*).
 
         This is the bridge that makes the documented environment variables
         actually reach the chunker; without it callers silently run on the
@@ -74,135 +89,51 @@ class ChunkingStats:
     avg_chunk_size: float = 0.0
 
 
-# ============================================================================
-# THREAD-SAFE EMBEDDINGS CACHE
-# ============================================================================
+_embeddings_by_model: Dict[str, HuggingFaceEmbeddings] = {}
+_embeddings_lock = threading.Lock()
 
 
-class ThreadSafeEmbeddingsCache:
+def get_embeddings(model_name: str) -> HuggingFaceEmbeddings:
+    """The local embeddings model, loaded once per process and shared.
+
+    Loading takes seconds, so concurrent chunkers wait on one lock rather
+    than each loading their own copy.
+
+    Raises:
+        ChunkingError: The model could not be loaded.
     """
-    Thread-safe singleton cache for embedding models.
-
-    Uses double-checked locking pattern for thread safety.
-    Each model has its own lock to allow concurrent loading of different models.
-    """
-
-    _instance: Optional["ThreadSafeEmbeddingsCache"] = None
-    _instance_lock = threading.Lock()
-
-    def __new__(cls):
-        """
-        Singleton pattern with thread-safe initialization.
-
-        Uses double-checked locking for performance.
-        """
-        if cls._instance is None:
-            with cls._instance_lock:
-                # Double-check inside lock
-                if cls._instance is None:
-                    instance = super().__new__(cls)
-                    instance._cache: Dict[str, HuggingFaceEmbeddings] = {}
-                    instance._model_locks: Dict[str, threading.Lock] = {}
-                    instance._locks_lock = threading.Lock()  # Lock for managing locks dict
-                    cls._instance = instance
-        return cls._instance
-
-    def _get_model_lock(self, model_name: str) -> threading.Lock:
-        """Get or create lock for specific model (thread-safe)."""
-        with self._locks_lock:
-            if model_name not in self._model_locks:
-                self._model_locks[model_name] = threading.Lock()
-            return self._model_locks[model_name]
-
-    def get_embeddings(self, model_name: str) -> HuggingFaceEmbeddings:
-        """
-        Get or create embeddings model with thread-safe access.
-
-        Args:
-            model_name: HuggingFace model identifier
-
-        Returns:
-            Cached or newly created embeddings model
-
-        Raises:
-            ChunkingError: If model loading fails
-        """
-        # Fast path: model already cached (no lock needed for read)
-        if model_name in self._cache:
-            logger.debug(f"Using cached embeddings model: {model_name}")
-            return self._cache[model_name]
-
-        # Slow path: need to load model (acquire model-specific lock)
-        model_lock = self._get_model_lock(model_name)
-        with model_lock:
-            # Double-check inside lock (another thread might have loaded it)
-            if model_name in self._cache:
-                logger.debug(f"Model loaded by another thread: {model_name}")
-                return self._cache[model_name]
-
-            # Load model
+    with _embeddings_lock:
+        if model_name not in _embeddings_by_model:
+            logger.info("Loading embeddings model %s", model_name)
+            start = time.perf_counter()
             try:
-                logger.info(f"Loading embeddings model: {model_name}")
-                start_time = time.time()
-
-                embeddings = HuggingFaceEmbeddings(model_name=model_name)
-
-                load_time = time.time() - start_time
-                logger.info(f"Loaded {model_name} in {load_time:.2f}s")
-
-                # Cache it
-                self._cache[model_name] = embeddings
-                return embeddings
-
+                _embeddings_by_model[model_name] = HuggingFaceEmbeddings(model_name=model_name)
             except Exception as e:
-                logger.error(f"Failed to load embeddings model {model_name}: {e}")
-                raise ChunkingError(f"Failed to load embeddings model: {e}") from e
-
-    def clear_cache(self):
-        """Clear all cached models (for testing or memory management)."""
-        with self._instance_lock:
-            self._cache.clear()
-            logger.info("Cleared embeddings cache")
-
-    def get_cache_info(self) -> Dict[str, Any]:
-        """Get information about cached models."""
-        return {"cached_models": list(self._cache.keys()), "cache_size": len(self._cache)}
-
-
-# ============================================================================
-# MARKDOWN CHUNKER
-# ============================================================================
+                raise ChunkingError(f"Failed to load embeddings model {model_name}: {e}") from e
+            logger.info("Loaded %s in %.2fs", model_name, time.perf_counter() - start)
+        return _embeddings_by_model[model_name]
 
 
 class MarkdownChunker:
-    """
-    Production Markdown document chunker.
-
-    Uses thread-safe singleton cache for embeddings models.
-    """
+    """Chunks one document's markdown (see the module docstring)."""
 
     def __init__(
         self,
         text: str,
-        config: Optional[Config] = None,
+        config: Optional[ChunkingConfig] = None,
         title: Optional[str] = None,
     ):
         if not text or not text.strip():
-            raise ValueError("Text cannot be empty")
+            raise ChunkingError("Text cannot be empty")
 
         self.text = text.strip()
-        self.config = config or Config()
+        self.config = config or ChunkingConfig()
         self.title = title or self._extract_title()
-        self.embeddings = self._get_embeddings() if self.config.enable_semantic else None
-
-    def _get_embeddings(self) -> Any:
-        """Get embeddings model from thread-safe cache."""
-        cache = ThreadSafeEmbeddingsCache()
-        return cache.get_embeddings(self.config.model)
+        self.embeddings = get_embeddings(self.config.model) if self.config.enable_semantic else None
 
     def _extract_title(self) -> str:
         """Extract title from first H1 header."""
-        return extract_first_h1(self.text, max_lines=10) or "Untitled"
+        return extract_first_h1(self.text, max_lines=10) or UNTITLED
 
     def _extract_headers(self, text: str) -> Dict[str, str]:
         """Extract current header context from text."""
@@ -223,120 +154,90 @@ class MarkdownChunker:
 
         return headers
 
-    async def chunk(self) -> Tuple[List[Document], ChunkingStats]:
-        """Execute chunking pipeline."""
-        start_time = time.time()
+    def chunk(self) -> Tuple[List[Document], ChunkingStats]:
+        """Run the four chunking steps (see the module docstring).
+
+        Raises:
+            ChunkingError: A step failed.
+        """
+        start_time = time.perf_counter()
 
         try:
-            # Step 1: Split by headers
-            chunks = await self._split_by_headers()
-
-            logger.info(f"Initial split by headers: {len(chunks)} chunks created.")
-
-            # Step 2: Split oversized chunks semantically (if enabled)
+            chunks = self._split_by_headers()
+            after_headers = len(chunks)
             if self.config.enable_semantic:
-                chunks = await self._split_oversized_chunks(chunks)
-
-            logger.info(f"After semantic splitting: {len(chunks)} chunks created.")
-
-            # Step 3: Combine small adjacent chunks
+                chunks = self._split_oversized_chunks(chunks)
+            after_semantic = len(chunks)
             chunks = self._combine_small_chunks(chunks)
-
-            logger.info(f"After combining small chunks: {len(chunks)} chunks created.")
-
-            # Step 4: Finalize metadata
             chunks = self._add_final_metadata(chunks)
 
-            # Calculate stats
-            processing_time = time.time() - start_time
+            processing_time = time.perf_counter() - start_time
             total_words = sum(len(c.page_content.split()) for c in chunks)
             stats = ChunkingStats(
                 total_chunks=len(chunks),
                 processing_time=processing_time,
                 avg_chunk_size=total_words / len(chunks) if chunks else 0,
             )
-
-            logger.info(f"Chunking completed: {len(chunks)} chunks in {processing_time:.2f}s")
+            logger.info(
+                "Chunked %r: %s header sections -> %s after semantic split -> %s chunks in %.2fs",
+                self.title,
+                after_headers,
+                after_semantic,
+                len(chunks),
+                processing_time,
+            )
             return chunks, stats
 
         except Exception as e:
-            logger.error(f"Chunking failed: {e}")
-            raise ChunkingError(f"Pipeline failed: {e}")
+            raise ChunkingError(f"Chunking failed: {e}") from e
 
-    async def _split_by_headers(self) -> List[Document]:
+    def _split_by_headers(self) -> List[Document]:
         """Split text by markdown headers."""
         headers_to_split = [
             (f"{'#' * i}", f"Header {i}") for i in range(1, self.config.max_header_level + 1)
         ]
 
-        try:
-            splitter = MarkdownHeaderTextSplitter(
-                headers_to_split_on=headers_to_split, strip_headers=False
-            )
-            docs = splitter.split_text(self.text)
+        splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=headers_to_split, strip_headers=False
+        )
+        docs = splitter.split_text(self.text)
 
-            # Ensure all docs have metadata (don't filter here, let combine step handle tiny chunks)
-            for doc in docs:
-                if not doc.metadata:
-                    doc.metadata = self._extract_headers(doc.page_content)
+        # Ensure all docs have metadata (don't filter here, let combine step handle tiny chunks)
+        for doc in docs:
+            if not doc.metadata:
+                doc.metadata = self._extract_headers(doc.page_content)
 
-            return docs
+        return docs
 
-        except Exception as e:
-            logger.warning(f"Header splitting failed: {e}")
-            # Fallback to single document
-            return [Document(page_content=self.text, metadata=self._extract_headers(self.text))]
-
-    async def _split_oversized_chunks(self, chunks: List[Document]) -> List[Document]:
-        """Split chunks that exceed max_size using semantic splitting."""
-        oversized_indices = [
-            idx
-            for idx, chunk in enumerate(chunks)
-            if len(chunk.page_content) > self.config.max_size
-        ]
-        if not oversized_indices:
+    def _split_oversized_chunks(self, chunks: List[Document]) -> List[Document]:
+        """Split chunks longer than max_size semantically, keeping document order."""
+        oversized = [chunk for chunk in chunks if len(chunk.page_content) > self.config.max_size]
+        if not oversized:
             return chunks
 
-        split_results: Dict[int, List[Document]] = {}
-
-        if self.config.enable_parallel and len(oversized_indices) > 1:
-            # Process oversized chunks in parallel
-            loop = asyncio.get_running_loop()
-            oversized = [chunks[idx] for idx in oversized_indices]
+        if self.config.enable_parallel and len(oversized) > 1:
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-                tasks = [
-                    loop.run_in_executor(executor, self._semantic_split, chunk)
-                    for chunk in oversized
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Collect results while preserving original chunk order
-            for i, result in enumerate(results):
-                original_idx = oversized_indices[i]
-                if isinstance(result, Exception):
-                    logger.warning(f"Semantic split failed for chunk {i}: {result}")
-                    split_results[original_idx] = [chunks[original_idx]]
-                else:
-                    split_results[original_idx] = result or [chunks[original_idx]]
+                pieces = list(executor.map(self._semantic_split, oversized))
         else:
-            # Process sequentially
-            for idx in oversized_indices:
-                result = self._semantic_split(chunks[idx])
-                split_results[idx] = result or [chunks[idx]]
+            pieces = [self._semantic_split(chunk) for chunk in oversized]
 
-        ordered_chunks: List[Document] = []
-        oversized_idx_set = set(oversized_indices)
-
-        for idx, chunk in enumerate(chunks):
-            if idx in oversized_idx_set:
-                ordered_chunks.extend(split_results.get(idx, [chunk]))
+        # _semantic_split never raises and returns at least the chunk itself.
+        replacements = iter(pieces)
+        ordered: List[Document] = []
+        for chunk in chunks:
+            if len(chunk.page_content) > self.config.max_size:
+                ordered.extend(next(replacements))
             else:
-                ordered_chunks.append(chunk)
-
-        return ordered_chunks
+                ordered.append(chunk)
+        return ordered
 
     def _semantic_split(self, chunk: Document) -> List[Document]:
-        """Split a single chunk using semantic chunking."""
+        """Split a single chunk using semantic chunking.
+
+        If the split fails, the oversized chunk is kept whole and marked
+        ``semantic_split_failed``, so degraded chunks can be found in the
+        stored chunk metadata instead of passing as normal ones.
+        """
         try:
             if not self.embeddings:
                 return [chunk]
@@ -352,87 +253,63 @@ class MarkdownChunker:
             return docs if len(docs) > 1 else [chunk]
 
         except Exception as e:
-            logger.warning(f"Semantic split failed: {e}")
-            return [chunk]
+            logger.warning(
+                "Semantic split failed; keeping a %s-character chunk whole: %s",
+                len(chunk.page_content),
+                e,
+            )
+            flagged = {**chunk.metadata, "semantic_split_failed": True}
+            return [Document(page_content=chunk.page_content, metadata=flagged)]
 
     def _combine_small_chunks(self, chunks: List[Document]) -> List[Document]:
+        """Merge small adjacent chunks, across section boundaries.
+
+        - A tiny chunk (under ``tiny_chunk_threshold``) always joins the next
+          one, whatever the size of the result.
+        - A chunk of at least ``min_size`` stays as it is.
+        - Otherwise the chunk absorbs following ones until it reaches
+          ``min_size``, stopping before it would exceed ``max_size``.
+
+        Merged chunks keep every header set they cover in ``all_headers``,
+        so the table of contents can recover each section heading.
         """
-        Combines adjacent small text chunks into larger ones.
+        merged: List[Document] = []
+        start = 0
+        while start < len(chunks):
+            size = len(chunks[start].page_content)
+            if size < self.config.tiny_chunk_threshold and start + 1 < len(chunks):
+                end = start + 2
+            elif size >= self.config.min_size:
+                end = start + 1
+            else:
+                end = self._end_of_small_run(chunks, start)
+            merged.append(self._join(chunks[start:end]))
+            start = end
+        return merged
 
-        Merges freely across section boundaries. All unique header sets
-        are accumulated in 'all_headers' metadata so the TOC builder
-        can recover every section heading.
+    def _end_of_small_run(self, chunks: List[Document], start: int) -> int:
+        """Where a merge that starts at a small chunk stops (exclusive index)."""
+        size = len(chunks[start].page_content)
+        end = start + 1
+        while end < len(chunks) and size < self.config.min_size:
+            next_size = len(chunks[end].page_content)
+            if size + next_size > self.config.max_size:
+                break
+            size += next_size
+            end += 1
+        return end
 
-        Args:
-            chunks: A list of Document objects to process.
-
-        Returns:
-            A new list of Document objects with small chunks merged.
-        """
-        if not chunks:
-            return []
-
-        merged_chunks: List[Document] = []
-        chunk_index = 0
-        tiny_chunk_threshold = self.config.tiny_chunk_threshold
-
-        while chunk_index < len(chunks):
-            current_chunk = chunks[chunk_index]
-            # All size thresholds (tiny/min/max) are in characters, matching
-            # the config docs; accumulation below also counts characters.
-            current_chunk_size = len(current_chunk.page_content)
-
-            # If a chunk is tiny, merge with next chunk.
-            if current_chunk_size < tiny_chunk_threshold and (chunk_index + 1) < len(chunks):
-                next_chunk = chunks[chunk_index + 1]
-                merged_content = "\n\n".join([current_chunk.page_content, next_chunk.page_content])
-                merged_metadata = self._merge_metadata(
-                    current_chunk.metadata.copy(), next_chunk.metadata
-                )
-                merged_metadata["is_combined"] = True
-
-                new_chunk = Document(page_content=merged_content, metadata=merged_metadata)
-                merged_chunks.append(new_chunk)
-                chunk_index += 2
-                continue
-
-            # If the current chunk is large enough, add it and move on.
-            if current_chunk_size >= self.config.min_size:
-                merged_chunks.append(current_chunk)
-                chunk_index += 1
-                continue
-
-            # Start combining other small chunks.
-            content_parts = [current_chunk.page_content]
-            combined_metadata = current_chunk.metadata.copy()
-            combined_size = current_chunk_size
-
-            next_chunk_index = chunk_index + 1
-
-            while next_chunk_index < len(chunks):
-                next_chunk = chunks[next_chunk_index]
-
-                if combined_size + len(next_chunk.page_content) > self.config.max_size:
-                    break
-
-                content_parts.append(next_chunk.page_content)
-                combined_metadata = self._merge_metadata(combined_metadata, next_chunk.metadata)
-                combined_size += len(next_chunk.page_content)
-                next_chunk_index += 1
-
-                if combined_size >= self.config.min_size:
-                    break
-
-            merged_content = "\n\n".join(content_parts)
-            new_chunk = Document(page_content=merged_content, metadata=combined_metadata)
-
-            if next_chunk_index > chunk_index + 1:
-                new_chunk.metadata["is_combined"] = True
-
-            merged_chunks.append(new_chunk)
-            chunk_index = next_chunk_index
-
-        return merged_chunks
+    def _join(self, run: List[Document]) -> Document:
+        """One chunk from a run of adjacent chunks (a run of one is returned as is)."""
+        if len(run) == 1:
+            return run[0]
+        metadata = run[0].metadata.copy()
+        for chunk in run[1:]:
+            metadata = self._merge_metadata(metadata, chunk.metadata)
+        metadata["is_combined"] = True
+        return Document(
+            page_content="\n\n".join(chunk.page_content for chunk in run), metadata=metadata
+        )
 
     def _extract_header_set(self, metadata: Dict) -> Dict[str, str]:
         """Extract just the Header N keys from metadata as a dict."""
@@ -508,8 +385,7 @@ class MarkdownChunker:
         clean output format: all_header_paths (list of delimited strings)
         and header_level_map (dict of header text to level).
 
-        Removes all intermediate metadata fields (Header N, all_headers,
-        chunk_index, primary_header, header_level, section_path).
+        Removes the intermediate metadata fields (Header N, all_headers).
         """
         for chunk in chunks:
             # Collect header dicts from all_headers (combined) or Header N keys
@@ -528,18 +404,8 @@ class MarkdownChunker:
                     all_paths.append(path)
                 level_map.update(lmap)
 
-            # Remove old keys
-            keys_to_remove = [k for k in chunk.metadata if k.startswith("Header ")]
-            keys_to_remove.extend(
-                [
-                    "all_headers",
-                    "primary_header",
-                    "header_level",
-                    "section_path",
-                    "chunk_index",
-                ]
-            )
-            for key in keys_to_remove:
+            # Drop the intermediate header keys
+            for key in [k for k in chunk.metadata if k.startswith("Header ")] + ["all_headers"]:
                 chunk.metadata.pop(key, None)
 
             # Set new metadata

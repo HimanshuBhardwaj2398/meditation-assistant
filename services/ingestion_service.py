@@ -8,9 +8,10 @@ import asyncio
 from functools import lru_cache
 from typing import Callable, Optional
 
+from core.exceptions import PipelineError
 from core.interfaces import StageStatus
 from ingestion.embed import VectorStoreConfig
-from ingestion.orchestrator import IngestionOrchestrator, IngestionResult
+from ingestion.orchestrator import IngestionOrchestrator, IngestionResult, ReprocessMode
 
 
 @lru_cache(maxsize=None)
@@ -93,8 +94,8 @@ async def ingest_document_async(
         tags=all_tags,
         doc_metadata=metadata,
     )
-    return await orchestrator.process(
-        source=admission.document_id,
+    return await orchestrator.resume(
+        admission.document_id,
         title=title,
         on_stage_update=on_stage_update,
     )
@@ -133,25 +134,33 @@ async def process_document_by_id_async(
     clear_markdown: bool = False,
 ) -> IngestionResult:
     """
-    Process/resume a document by its ID.
+    Resume a document by its ID, or reprocess it when a mode is given.
 
     Args:
         doc_id: Database ID of the document to process
         collection_name: Name of the vector store collection
-        reprocess_mode: Optional reprocessing mode for existing docs
+        reprocess_mode: Optional reprocessing mode ("full", "from_chunking",
+            "from_embedding")
         clear_markdown: Clear stored markdown before reprocessing (full mode only)
 
     Returns:
-        dict: Result from orchestrator
+        The orchestrator's result
+
+    Raises:
+        PipelineError: An unknown reprocess_mode, or clear_markdown without
+            a reprocess_mode of "full".
     """
     orchestrator = get_orchestrator(collection_name)
-    result = await orchestrator.process(
-        source=doc_id,
-        on_stage_update=on_stage_update,
-        reprocess_mode=reprocess_mode,
+    if reprocess_mode is None:
+        if clear_markdown:
+            raise PipelineError("clear_markdown is only supported with reprocess_mode='full'")
+        return await orchestrator.resume(doc_id, on_stage_update=on_stage_update)
+    return await orchestrator.reprocess(
+        doc_id,
+        ReprocessMode.parse(reprocess_mode),
         clear_markdown=clear_markdown,
+        on_stage_update=on_stage_update,
     )
-    return result
 
 
 def process_document_by_id(

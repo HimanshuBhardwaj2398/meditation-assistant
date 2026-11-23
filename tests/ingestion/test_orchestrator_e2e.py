@@ -12,6 +12,7 @@ from sqlalchemy import select
 from core.exceptions import DatabaseError, ParsingError
 from db.crud import DocumentCRUD
 from db.schema import Chunk, Document, DocumentStatus
+from ingestion.claim import ReprocessMode
 from tests.ingestion.conftest import PROVENANCE, SOURCE, SUTTA_MARKDOWN, TITLE
 
 
@@ -43,7 +44,7 @@ def assert_published_in_step(state, vectors, document_id):
 
 
 async def test_new_source_is_published_completed(orchestrator, ingest_db, vectors):
-    result = await orchestrator.process(SOURCE)
+    result = await orchestrator.ingest(SOURCE)
 
     assert result["success"] is True, result["errors"]
     document_id = result["document_id"]
@@ -63,7 +64,7 @@ async def test_new_source_is_published_completed(orchestrator, ingest_db, vector
 async def test_parse_failure_marks_document_failed(orchestrator, ingest_db, parser, vectors):
     parser.error = ParsingError("source offline")
 
-    result = await orchestrator.process(SOURCE)
+    result = await orchestrator.ingest(SOURCE)
 
     assert result["success"] is False
     assert "source offline" in result["errors"]["parsing"]
@@ -82,7 +83,7 @@ async def test_failed_publication_rolls_back_then_retry_completes(
 
     with monkeypatch.context() as patch:
         patch.setattr(DocumentCRUD, "clear_chunks", interrupt)
-        failed = await orchestrator.process(SOURCE)
+        failed = await orchestrator.ingest(SOURCE)
 
     assert failed["success"] is False
     assert failed["errors"]["database_persistence"] == "publication interrupted"
@@ -92,7 +93,7 @@ async def test_failed_publication_rolls_back_then_retry_completes(
     assert state.uuids == []
     assert vectors.rows() == []
 
-    retried = await orchestrator.process(document_id)
+    retried = await orchestrator.resume(document_id)
 
     assert retried["success"] is True, retried["errors"]
     state = snapshot(ingest_db, document_id)
@@ -101,11 +102,11 @@ async def test_failed_publication_rolls_back_then_retry_completes(
 
 
 async def test_reprocess_from_chunking_reuses_markdown(orchestrator, ingest_db, parser, vectors):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     before = snapshot(ingest_db, document_id)
 
-    result = await orchestrator.process(document_id, reprocess_mode="from_chunking")
+    result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_CHUNKING)
 
     assert result["success"] is True, result["errors"]
     assert parser.calls == [SOURCE]
@@ -118,11 +119,11 @@ async def test_reprocess_from_chunking_reuses_markdown(orchestrator, ingest_db, 
 
 
 async def test_reprocess_from_embedding_reuses_chunk_rows(orchestrator, ingest_db, parser, vectors):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     before = snapshot(ingest_db, document_id)
 
-    result = await orchestrator.process(document_id, reprocess_mode="from_embedding")
+    result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_EMBEDDING)
 
     assert result["success"] is True, result["errors"]
     assert parser.calls == [SOURCE]
@@ -134,10 +135,10 @@ async def test_reprocess_from_embedding_reuses_chunk_rows(orchestrator, ingest_d
 
 
 async def test_reprocess_full_parses_again(orchestrator, ingest_db, parser, vectors):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
 
-    result = await orchestrator.process(document_id, reprocess_mode="full")
+    result = await orchestrator.reprocess(document_id, ReprocessMode.FULL)
 
     assert result["success"] is True, result["errors"]
     assert parser.calls == [SOURCE, SOURCE]
@@ -168,7 +169,7 @@ async def test_status_trail_for_a_new_source(orchestrator, ingest_db, monkeypatc
     monkeypatch.setattr(DocumentCRUD, "claim_for_processing", recording_claim)
     monkeypatch.setattr(DocumentCRUD, "set_status_if_owner", recording_write)
 
-    result = await orchestrator.process(SOURCE)
+    result = await orchestrator.ingest(SOURCE)
 
     assert result["success"] is True, result["errors"]
     assert trail == [
@@ -183,7 +184,7 @@ async def test_status_trail_for_a_new_source(orchestrator, ingest_db, monkeypatc
 
 
 async def test_a_reprocess_starts_at_the_stage_it_runs_first(orchestrator, ingest_db, monkeypatch):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     statuses = []
     claim = DocumentCRUD.claim_for_processing
 
@@ -193,7 +194,7 @@ async def test_a_reprocess_starts_at_the_stage_it_runs_first(orchestrator, inges
 
     monkeypatch.setattr(DocumentCRUD, "claim_for_processing", recording_claim)
 
-    await orchestrator.process(first["document_id"], reprocess_mode="from_chunking")
-    await orchestrator.process(first["document_id"], reprocess_mode="from_embedding")
+    await orchestrator.reprocess(first["document_id"], ReprocessMode.FROM_CHUNKING)
+    await orchestrator.reprocess(first["document_id"], ReprocessMode.FROM_EMBEDDING)
 
     assert statuses == [DocumentStatus.CHUNKING, DocumentStatus.EMBEDDING]

@@ -51,7 +51,7 @@ def test_cli_shared_title_processes_every_source(cli_modules, monkeypatch):
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_cli_display_title_does_not_override_extraction(cli_modules, verbose):
     orchestrator = SimpleNamespace(
-        process=AsyncMock(
+        ingest=AsyncMock(
             return_value={
                 "document_id": 1,
                 "title": "Extracted",
@@ -63,7 +63,7 @@ async def test_cli_display_title_does_not_override_extraction(cli_modules, verbo
         )
     )
     await cli_modules.ingest.ingest_document(orchestrator, "a.pdf", verbose=verbose)
-    orchestrator.process.assert_awaited_once_with(source="a.pdf", title=None)
+    orchestrator.ingest.assert_awaited_once_with("a.pdf", title=None)
 
 
 @pytest.mark.parametrize(
@@ -77,16 +77,18 @@ async def test_cli_display_title_does_not_override_extraction(cli_modules, verbo
 async def test_batch_sends_every_source_through_admission(
     cli_modules, monkeypatch, outcome, expected_success
 ):
-    """Completed sources are skipped and failed ones resume, inside process()."""
+    """Completed sources are skipped and failed ones resume, inside ingest()."""
     cli = cli_modules.ingest_batch
     result = {"document_id": 7, "chunk_count": 1, "errors": {}, **outcome}
-    processor = SimpleNamespace(process=AsyncMock(return_value=result))
+    processor = SimpleNamespace(ingest=AsyncMock(return_value=result))
     monkeypatch.setattr(cli, "IngestionOrchestrator", lambda **kwargs: processor)
 
-    success = await cli._ingest_all(["sc:mn1/sujato"], "test", "postgresql://test/test")
+    success = await cli._ingest_all(
+        ["sc:mn1/sujato"], "test", "postgresql://test/test", MagicMock()
+    )
 
     assert success is expected_success
-    processor.process.assert_awaited_once_with("sc:mn1/sujato")
+    processor.ingest.assert_awaited_once_with("sc:mn1/sujato")
 
 
 async def test_batch_reports_a_busy_source_and_carries_on(cli_modules, monkeypatch):
@@ -95,16 +97,16 @@ async def test_batch_reports_a_busy_source_and_carries_on(cli_modules, monkeypat
     cli = cli_modules.ingest_batch
     done = {"document_id": 8, "chunk_count": 1, "errors": {}, "success": True}
     processor = SimpleNamespace(
-        process=AsyncMock(side_effect=[DocumentBusyError("another run"), done])
+        ingest=AsyncMock(side_effect=[DocumentBusyError("another run"), done])
     )
     monkeypatch.setattr(cli, "IngestionOrchestrator", lambda **kwargs: processor)
 
     success = await cli._ingest_all(
-        ["sc:mn1/sujato", "sc:mn2/sujato"], "test", "postgresql://test/test"
+        ["sc:mn1/sujato", "sc:mn2/sujato"], "test", "postgresql://test/test", MagicMock()
     )
 
     assert success is False
-    assert processor.process.await_count == 2
+    assert processor.ingest.await_count == 2
 
 
 @pytest.mark.parametrize("module_name", ["ingest_one", "ingest_batch"])
@@ -125,7 +127,7 @@ def test_single_and_batch_exit_status(cli_modules, monkeypatch, module_name, suc
         cli,
         "IngestionOrchestrator",
         lambda **kwargs: SimpleNamespace(
-            process=AsyncMock(
+            ingest=AsyncMock(
                 return_value={
                     "document_id": 7,
                     "title": "Title",
@@ -153,7 +155,7 @@ async def test_bulk_failure_keeps_stage_and_error_message(cli_modules, monkeypat
         cli,
         "_build_orchestrator",
         lambda url: SimpleNamespace(
-            process=AsyncMock(
+            ingest=AsyncMock(
                 return_value={"success": False, "errors": {"embedding": "rate limited"}}
             ),
         ),
@@ -233,7 +235,7 @@ async def test_ingest_cli_defaults_to_the_configured_collection(cli_modules, mon
     def build(vector_store_config, **kwargs):
         built["collection"] = vector_store_config.collection_name
         result = {"document_id": 7, "chunk_count": 1, "success": True, "errors": {}}
-        return SimpleNamespace(process=AsyncMock(return_value=result))
+        return SimpleNamespace(ingest=AsyncMock(return_value=result))
 
     monkeypatch.setattr(cli, "IngestionOrchestrator", build)
 

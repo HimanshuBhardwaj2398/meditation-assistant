@@ -1,4 +1,6 @@
-"""Tests for ingestion reprocess mode validation."""
+"""Reprocess modes: parsing them at the boundary, and the clear_markdown rule."""
+
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,32 +15,32 @@ def _build_orchestrator() -> IngestionOrchestrator:
         vector_store_config=VectorStoreConfig(
             collection_name="test_collection",
             db_url="postgresql://user:pass@localhost:5432/test_db",
-        )
+        ),
+        vector_store_manager=MagicMock(),
+        database=MagicMock(),
     )
 
 
-def test_parse_reprocess_mode_accepts_strings_and_enum():
-    assert IngestionOrchestrator._parse_reprocess_mode("full") == ReprocessMode.FULL
-    assert (
-        IngestionOrchestrator._parse_reprocess_mode("from_chunking") == ReprocessMode.FROM_CHUNKING
-    )
-    assert (
-        IngestionOrchestrator._parse_reprocess_mode(ReprocessMode.FROM_EMBEDDING)
-        == ReprocessMode.FROM_EMBEDDING
-    )
+@pytest.mark.parametrize("mode", list(ReprocessMode))
+def test_parse_accepts_each_mode_name(mode):
+    assert ReprocessMode.parse(mode.value) is mode
 
 
-def test_parse_reprocess_mode_rejects_invalid_value():
-    with pytest.raises(PipelineError, match="Invalid reprocess_mode"):
-        IngestionOrchestrator._parse_reprocess_mode("not_a_mode")
+def test_parse_rejects_an_unknown_mode_listing_the_allowed_ones():
+    with pytest.raises(PipelineError, match="Invalid reprocess mode 'not_a_mode'.*from_chunking"):
+        ReprocessMode.parse("not_a_mode")
 
 
-@pytest.mark.asyncio
-async def test_clear_markdown_requires_full_mode():
-    orchestrator = _build_orchestrator()
+@pytest.mark.parametrize("mode", [ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING])
+async def test_clear_markdown_requires_full_mode(mode):
+    with pytest.raises(PipelineError, match="clear_markdown is only supported"):
+        await _build_orchestrator().reprocess(1, mode, clear_markdown=True)
 
-    with pytest.raises(
-        PipelineError,
-        match="clear_markdown is only supported with reprocess_mode='full'",
-    ):
-        await orchestrator.process(source="dummy-source", clear_markdown=True)
+
+async def test_the_service_rejects_clear_markdown_without_a_mode(monkeypatch):
+    from services import ingestion_service
+
+    monkeypatch.setattr(ingestion_service, "get_orchestrator", lambda name: _build_orchestrator())
+
+    with pytest.raises(PipelineError, match="clear_markdown is only supported"):
+        await ingestion_service.process_document_by_id_async(1, clear_markdown=True)

@@ -12,6 +12,7 @@ from core.exceptions import DocumentNotFoundError, EmbeddingError, VectorStoreEr
 from db.schema import Document
 from db.vector_consistency import check_vector_consistency, delete_orphan_vectors
 from ingestion.admission import VECTOR_COLLECTION_KEY, admit
+from ingestion.claim import ReprocessMode
 from ingestion.embed import VectorStoreConfig
 from ingestion.orchestrator import IngestionOrchestrator
 from services.collection_service import CollectionService
@@ -38,7 +39,7 @@ def collections_of(vectors):
 
 
 async def test_a_new_document_records_and_publishes_into_its_collection(ingest_db, parser, vectors):
-    result = await orchestrator_for("primary", parser, vectors).process(SOURCE)
+    result = await orchestrator_for("primary", parser, vectors).ingest(SOURCE)
 
     assert result["success"] is True, result["errors"]
     assert recorded_collection(ingest_db, result["document_id"]) == "primary"
@@ -47,10 +48,10 @@ async def test_a_new_document_records_and_publishes_into_its_collection(ingest_d
 
 async def test_a_retry_from_elsewhere_stays_in_the_documents_collection(ingest_db, parser, vectors):
     vectors.fail_next = EmbeddingError("provider down")
-    failed = await orchestrator_for("primary", parser, vectors).process(SOURCE)
+    failed = await orchestrator_for("primary", parser, vectors).ingest(SOURCE)
     assert failed["success"] is False
 
-    retried = await orchestrator_for("secondary", parser, vectors).process(SOURCE)
+    retried = await orchestrator_for("secondary", parser, vectors).ingest(SOURCE)
 
     assert retried["success"] is True, retried["errors"]
     assert recorded_collection(ingest_db, retried["document_id"]) == "primary"
@@ -60,10 +61,10 @@ async def test_a_retry_from_elsewhere_stays_in_the_documents_collection(ingest_d
 async def test_a_reprocess_from_elsewhere_stays_in_the_documents_collection(
     ingest_db, parser, vectors
 ):
-    first = await orchestrator_for("primary", parser, vectors).process(SOURCE)
+    first = await orchestrator_for("primary", parser, vectors).ingest(SOURCE)
 
-    result = await orchestrator_for("secondary", parser, vectors).process(
-        first["document_id"], reprocess_mode="from_chunking"
+    result = await orchestrator_for("secondary", parser, vectors).reprocess(
+        first["document_id"], ReprocessMode.FROM_CHUNKING
     )
 
     assert result["success"] is True, result["errors"]
@@ -76,7 +77,7 @@ async def test_an_older_document_inherits_the_collection_its_vectors_are_in(
     legacy = admit(SOURCE)  # admitted without recording a collection
     vectors.existing_collections[legacy.document_id] = "legacy"
 
-    result = await orchestrator_for("primary", parser, vectors).process(legacy.document_id)
+    result = await orchestrator_for("primary", parser, vectors).resume(legacy.document_id)
 
     assert result["success"] is True, result["errors"]
     assert recorded_collection(ingest_db, legacy.document_id) == "legacy"
@@ -88,7 +89,7 @@ async def test_an_older_document_without_vectors_gets_the_configured_collection(
 ):
     legacy = admit(SOURCE)
 
-    await orchestrator_for("primary", parser, vectors).process(legacy.document_id)
+    await orchestrator_for("primary", parser, vectors).resume(legacy.document_id)
 
     assert recorded_collection(ingest_db, legacy.document_id) == "primary"
 
@@ -102,7 +103,7 @@ def service_with(vectors):
 async def test_deleting_a_document_removes_its_chunks_and_every_vector(
     orchestrator, ingest_db, vectors
 ):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     with ingest_db.session_scope() as session:
         session.execute(
@@ -125,7 +126,7 @@ async def test_deleting_a_document_removes_its_chunks_and_every_vector(
 
 
 async def test_a_failed_delete_deletes_nothing(orchestrator, ingest_db, vectors, monkeypatch):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     before = snapshot(ingest_db, document_id)
     vectors_before = vectors.rows()
@@ -203,13 +204,13 @@ async def test_postgres_reprocess_keeps_the_documents_collection(postgres_databa
     beta = postgres_orchestrator(db, "beta", monkeypatch)
     _ = beta.vector_store_manager.vector_store  # creates the "beta" collection
 
-    first = await alpha.process(SOURCE)
+    first = await alpha.ingest(SOURCE)
     assert first["success"] is True, first["errors"]
     document_id = first["document_id"]
     with db.session_scope() as session:
         assert alpha.vector_store_manager.collection_of_document(session, document_id) == "alpha"
 
-    result = await beta.process(document_id, reprocess_mode="from_chunking")
+    result = await beta.reprocess(document_id, ReprocessMode.FROM_CHUNKING)
 
     assert result["success"] is True, result["errors"]
     with db.session_scope() as session:
@@ -220,7 +221,7 @@ async def test_postgres_reprocess_keeps_the_documents_collection(postgres_databa
 async def test_postgres_consistency_report_and_orphan_repair(postgres_database, monkeypatch):
     db = postgres_database
     orchestrator = postgres_orchestrator(db, "alpha", monkeypatch)
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     assert first["success"] is True, first["errors"]
     document_id = first["document_id"]
 
@@ -278,7 +279,7 @@ async def test_postgres_consistency_report_and_orphan_repair(postgres_database, 
 async def test_postgres_delete_removes_every_vector_of_the_document(postgres_database, monkeypatch):
     db = postgres_database
     orchestrator = postgres_orchestrator(db, "alpha", monkeypatch)
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     service = CollectionService(
         collection_name="alpha", db_url=db.engine.url.render_as_string(hide_password=False)

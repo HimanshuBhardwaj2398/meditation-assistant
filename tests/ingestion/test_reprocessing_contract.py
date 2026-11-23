@@ -1,78 +1,42 @@
-"""Exercise real orchestration/stages with offline database and provider boundaries."""
+"""Reprocessing and parsing contracts, on the SQLite fixtures (see conftest)."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from langchain.schema import Document
 
 from core.interfaces import ParseResult, PipelineContext, StageStatus
-from db.schema import DocumentStatus
-from ingestion.embed import VectorStoreConfig
-from ingestion.orchestrator import IngestionOrchestrator
+from db.schema import Document as DbDocument
+from ingestion.admission import admit
+from ingestion.claim import ReprocessMode
 from ingestion.stages import ParsingStage
+from tests.ingestion.conftest import PROVENANCE, SOURCE
 
 
-@pytest.mark.parametrize("mode", ["from_chunking", "from_embedding"])
-async def test_reprocessing_preserves_source_metadata_in_vectors(monkeypatch, mode):
-    from db import crud, database
-    from ingestion import stages
+@pytest.mark.parametrize("mode", [ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING])
+async def test_reprocessing_preserves_source_metadata_in_vectors(
+    orchestrator, parser, vectors, monkeypatch, mode
+):
+    first = await orchestrator.ingest(SOURCE)
+    embedded: list = []
+    compute = vectors.compute_embeddings
 
-    metadata = {
-        "source": "suttacentral",
-        "uid": "mn1",
-        "author_uid": "sujato",
-        "lang": "en",
-        "nikaya": "mn",
-        "nikaya_name": "majjhima_nikaya",
-    }
-    doc = SimpleNamespace(
-        id=7,
-        title="Stored title",
-        markdown="Stored markdown",
-        file_path="sc:mn1/sujato",
-        doc_metadata={**metadata, "table_of_contents": {"entries": []}},
-        chunks=None,
-        status=DocumentStatus.COMPLETED,
-    )
-    document_crud = MagicMock()
-    document_crud.get_document_by_id.return_value = doc
-    chunk_crud = MagicMock()
-    chunk_crud.get_chunks_by_document.return_value = [
-        SimpleNamespace(uuid="old-id", chunk_text="Stored chunk", chunk_metadata={})
-    ]
-    monkeypatch.setattr(database, "session_scope", lambda: nullcontext(MagicMock()))
-    monkeypatch.setattr(crud, "DocumentCRUD", lambda session: document_crud)
-    monkeypatch.setattr(crud, "ChunkCRUD", lambda session: chunk_crud)
-    chunker = MagicMock()
-    chunker.chunk = AsyncMock(
-        return_value=(
-            [Document(page_content="Regenerated chunk")],
-            SimpleNamespace(total_chunks=1, processing_time=0, avg_chunk_size=2),
-        )
-    )
-    monkeypatch.setattr(stages, "MarkdownChunker", lambda **kwargs: chunker)
+    def capture(documents):
+        embedded.extend(documents)
+        return compute(documents)
 
-    async def persist(self, context):
-        return context.mark_stage_completed(self.name)
+    monkeypatch.setattr(vectors, "compute_embeddings", capture)
 
-    monkeypatch.setattr(stages.DatabasePersistenceStage, "execute", persist)
-    orchestrator = IngestionOrchestrator(VectorStoreConfig(db_url="postgresql://test/test"))
-    orchestrator.parser_factory = MagicMock()
-    vector_store = MagicMock()
-    vector_store.compute_embeddings.side_effect = lambda docs: [[1.0] for _ in docs]
-    orchestrator.vector_store_manager = vector_store
-
-    result = await orchestrator.process(7, reprocess_mode=mode)
+    result = await orchestrator.reprocess(first["document_id"], mode)
 
     assert result["success"] is True
-    orchestrator.parser_factory.parse.assert_not_called()
-    embedded = vector_store.compute_embeddings.call_args.args[0]
-    assert len(embedded) == 1
-    for key, value in metadata.items():
-        assert embedded[0].metadata[key] == value
-    assert "table_of_contents" not in embedded[0].metadata
+    assert parser.calls == [SOURCE]  # the reprocess did not parse again
+    assert embedded
+    for chunk in embedded:
+        for key, value in PROVENANCE.items():
+            assert chunk.metadata[key] == value
+        assert "table_of_contents" not in chunk.metadata
 
 
 @pytest.mark.parametrize(
@@ -85,27 +49,24 @@ async def test_reprocessing_preserves_source_metadata_in_vectors(monkeypatch, mo
     ],
 )
 async def test_parsing_title_is_consistent_in_context_and_database(
-    monkeypatch,
-    supplied,
-    extracted,
-    expected,
+    ingest_db, supplied, extracted, expected
 ):
-    from db import crud, database
-
-    doc = SimpleNamespace(title="Untitled", tags=[], doc_metadata={})
-    document_crud = MagicMock()
-    document_crud.get_document_by_id.return_value = doc
-    monkeypatch.setattr(database, "session_scope", lambda: nullcontext(MagicMock()))
-    monkeypatch.setattr(crud, "DocumentCRUD", lambda session: document_crud)
+    document_id = admit(SOURCE, database=ingest_db).document_id
+    with ingest_db.session_scope() as session:
+        session.get(DbDocument, document_id).processing_token = "run"
     factory = MagicMock()
     factory.parse.return_value = ParseResult(content="Content", title=extracted)
 
-    result = await ParsingStage(factory).execute(
-        PipelineContext(document_id=7, source="source", title=supplied)
+    result = await ParsingStage(factory, ingest_db).execute(
+        PipelineContext(
+            document_id=document_id, source=SOURCE, title=supplied, processing_token="run"
+        )
     )
 
     assert result.stage_results["parsing"] == StageStatus.COMPLETED
-    assert result.title == doc.title == expected
+    with ingest_db.session_scope() as session:
+        stored_title = session.get(DbDocument, document_id).title
+    assert result.title == stored_title == expected
 
 
 @pytest.mark.parametrize(
@@ -137,7 +98,7 @@ async def test_collection_reprocess_propagates_pipeline_outcome(
     monkeypatch.setattr(service, "session_scope", lambda: nullcontext(MagicMock()))
     monkeypatch.setattr(service, "DocumentCRUD", lambda session: document_crud)
     monkeypatch.setattr(service, "ChunkCRUD", lambda session: chunk_crud)
-    orchestrator = SimpleNamespace(process=AsyncMock(return_value=pipeline_result))
+    orchestrator = SimpleNamespace(reprocess=AsyncMock(return_value=pipeline_result))
     monkeypatch.setattr(service, "IngestionOrchestrator", lambda **kwargs: orchestrator)
 
     result = await service.CollectionService(db_url="postgresql://test/test").reprocess_document(7)
