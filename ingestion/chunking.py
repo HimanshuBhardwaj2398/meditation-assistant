@@ -28,7 +28,7 @@ from langchain_core.documents import Document
 from langchain_experimental.text_splitter import SemanticChunker
 
 from core.exceptions import ChunkingError, ConfigurationError
-from ingestion.markdown_utils import extract_first_h1
+from ingestion.markdown_utils import UNTITLED, extract_first_h1
 
 if TYPE_CHECKING:
     from config.settings import ChunkingSettings
@@ -133,7 +133,7 @@ class MarkdownChunker:
 
     def _extract_title(self) -> str:
         """Extract title from first H1 header."""
-        return extract_first_h1(self.text, max_lines=10) or "Untitled"
+        return extract_first_h1(self.text, max_lines=10) or UNTITLED
 
     def _extract_headers(self, text: str) -> Dict[str, str]:
         """Extract current header context from text."""

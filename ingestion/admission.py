@@ -19,6 +19,7 @@ from core.exceptions import DatabaseError
 from db.crud import DocumentCRUD
 from db.database import Database, get_database
 from db.schema import DocumentStatus
+from ingestion.markdown_utils import UNTITLED
 from ingestion.suttacentral import SuttaCentralParser, parse_sutta_ref
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,7 @@ def admit(
         crud = DocumentCRUD(session)
         new_id = crud.insert_if_absent(
             file_path=source,
-            title=title or "Untitled",
+            title=title or UNTITLED,
             description=description,
             tags=tags,
             doc_metadata=doc_metadata,

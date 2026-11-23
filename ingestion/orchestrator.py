@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from config.settings import IngestionSettings
 from core.exceptions import DocumentNotFoundError, PipelineError, ProcessingLeaseLostError
-from core.interfaces import PipelineContext, PipelineStage, StageName, StageStatus
+from core.interfaces import PipelineStage, StageName, StageStatus
 from db.crud import ChunkCRUD, DocumentCRUD
 from db.database import Database, get_database
 from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
@@ -308,21 +308,9 @@ class IngestionOrchestrator:
                 on_stage_update(stage_name, stage_status)
 
         pipeline = PipelineOrchestrator(self._build_stages())
-        context = PipelineContext(
-            document_id=run.document_id,
-            source=run.source,
-            title=run.title,
-            parsed_content=run.parsed_content,
-            chunks=run.chunks,
-            stage_results=run.stage_results,
-            source_metadata=run.source_metadata,
-            processing_token=run.token,
-            vector_collection=run.vector_collection,
-        )
-
         try:
-            logger.info(f"Starting pipeline for document {run.document_id}")
-            final_context = await pipeline.execute(context, on_stage_update=_on_stage_update)
+            logger.info("Starting pipeline for document %s", run.document_id)
+            final_context = await pipeline.execute(run.context, on_stage_update=_on_stage_update)
 
             success = (
                 final_context.stage_results.get(StageName.DATABASE_PERSISTENCE)
@@ -330,7 +318,7 @@ class IngestionOrchestrator:
             )
             result = IngestionResult(
                 document_id=run.document_id,
-                source=run.source,
+                source=final_context.source,
                 title=final_context.title,
                 chunk_count=len(final_context.chunks) if final_context.chunks else 0,
                 reprocess_mode=mode.value if mode else None,
@@ -343,9 +331,9 @@ class IngestionOrchestrator:
             )
 
             if success:
-                logger.info(f"Pipeline completed successfully for document {run.document_id}")
+                logger.info("Pipeline completed for document %s", run.document_id)
             else:
-                logger.warning(f"Pipeline partially completed for document {run.document_id}")
+                logger.warning("Pipeline did not complete for document %s", run.document_id)
                 details = "; ".join(
                     f"{stage}: {message}" for stage, message in final_context.error_messages.items()
                 )
@@ -359,6 +347,6 @@ class IngestionOrchestrator:
             )
             raise
         except Exception as e:
-            logger.error(f"Pipeline failed for document {run.document_id}: {e}", exc_info=True)
+            logger.error("Pipeline failed for document %s: %s", run.document_id, e, exc_info=True)
             await asyncio.to_thread(recorder.finish_failed, str(e))
             raise PipelineError(f"Pipeline execution failed: {e}") from e

@@ -28,6 +28,7 @@ from db.database import Database
 from db.schema import Document, DocumentStatus
 from ingestion.chunking import ChunkingConfig, MarkdownChunker
 from ingestion.embed import VectorStoreManager
+from ingestion.markdown_utils import UNTITLED
 from ingestion.parsing import ParserFactory
 from ingestion.toc import build_table_of_contents
 
@@ -142,7 +143,7 @@ class ParsingStage(_BlockingStage):
         logger.info(f"Successfully parsed: {context.source} (title: {result.title})")
 
         metadata = result.metadata or {}
-        title = context.title or result.title or "Untitled"
+        title = context.title or result.title or UNTITLED
         tags = metadata.get("tags")
         structured = source_provenance(metadata)
 
