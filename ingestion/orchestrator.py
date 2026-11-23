@@ -8,7 +8,7 @@ and records progress in ``documents.status``.
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
+from typing import Any, Dict, List, Optional, TypedDict
 
 from config.settings import IngestionSettings
 from core.exceptions import DocumentNotFoundError, PipelineError, ProcessingLeaseLostError
@@ -20,7 +20,7 @@ from ingestion.chunking import Config as ChunkingConfig
 from ingestion.claim import PreparedRun, ReprocessMode, claim_document
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.parsing import ParserFactory
-from ingestion.pipeline import PipelineOrchestrator
+from ingestion.pipeline import PipelineOrchestrator, StageCallback
 from ingestion.stages import (
     ChunkingStage,
     DatabasePersistenceStage,
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class IngestionResult(TypedDict):
-    """What ``IngestionOrchestrator.process`` reports for one document."""
+    """What ``ingest``, ``resume`` and ``reprocess`` report for one document."""
 
     document_id: int
     source: Optional[str]
@@ -98,102 +98,101 @@ class IngestionOrchestrator:
 
         logger.info("IngestionOrchestrator initialized with DAG pipeline")
 
-    @staticmethod
-    def _parse_reprocess_mode(
-        reprocess_mode: Optional[Union[ReprocessMode, str]],
-    ) -> Optional[ReprocessMode]:
-        """Normalize and validate optional reprocess mode."""
-        if reprocess_mode is None:
-            return None
-        if isinstance(reprocess_mode, ReprocessMode):
-            return reprocess_mode
-        try:
-            return ReprocessMode(reprocess_mode)
-        except ValueError as e:
-            allowed = ", ".join(mode.value for mode in ReprocessMode)
-            raise PipelineError(
-                f"Invalid reprocess_mode '{reprocess_mode}'. Allowed values: {allowed}"
-            ) from e
+    # ------------------------------------------------------------------
+    # Entry points
+    #
+    # Admission, claiming and status writes are database round trips: they
+    # run in worker threads, like the stages, to keep the event loop free.
+    # ------------------------------------------------------------------
 
-    async def process(
+    async def ingest(
         self,
-        source: Union[str, int],
+        source: str,
+        *,
         title: Optional[str] = None,
-        on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
-        reprocess_mode: Optional[Union[ReprocessMode, str]] = None,
-        clear_markdown: bool = False,
+        on_stage_update: Optional[StageCallback] = None,
     ) -> IngestionResult:
-        """
-        Process a document through the ingestion pipeline.
+        """Ingest a source: a SuttaCentral reference, a URL or a PDF path.
 
-        A source string goes through admission first: a new source gets a
-        document, and a source already in the corpus maps to its existing
-        document. Then, for the document:
-
-        - COMPLETED, no reprocess_mode: nothing runs; the result reports the
-          published version with ``already_completed=True``.
-        - Not completed: the run resumes, reusing stored markdown when the
-          earlier attempt got that far.
-        - With reprocess_mode: the run replaces the published version. If it
-          fails, the previous chunks and vectors stay published.
+        The source goes through admission (``ingestion.admission``). A new
+        source gets a document and runs. A source whose document is
+        COMPLETED runs nothing: the result reports the published version
+        with ``already_completed=True``. A source that never completed
+        resumes, as ``resume`` does.
 
         Args:
-            source: File path, URL, or document ID
-            title: Optional title (will be extracted if not provided)
-            on_stage_update: Optional callback(stage_name, status) for UI updates
-            reprocess_mode: Optional mode for existing documents:
-                - "full": re-parse + chunk + embed + persist
-                - "from_chunking": reuse stored markdown, rerun chunking+
-                  embedding+persistence
-                - "from_embedding": reuse stored chunks (and their UUIDs),
-                  rerun embedding+persistence
-            clear_markdown: With reprocess_mode="full", clear
-                documents.markdown before the run.
-
-        Returns:
-            The run's IngestionResult.
+            source: The source to ingest
+            title: Title for a new document (else the parsed one is used)
+            on_stage_update: Optional callback(stage_name, status), sync or
+                async, for progress updates
 
         Raises:
             DocumentBusyError: Another run is processing the document.
             ProcessingLeaseLostError: Another run took the document over during
                 this run, which stopped without writing anything.
         """
-        mode = self._parse_reprocess_mode(reprocess_mode)
-        if clear_markdown and mode != ReprocessMode.FULL:
-            raise PipelineError("clear_markdown is only supported with reprocess_mode='full'")
-
-        # Admission, claiming and status writes are database round trips: they
-        # run in worker threads, like the stages, to keep the event loop free.
         await asyncio.to_thread(self._check_same_database)
+        admission = await asyncio.to_thread(self.admit, source, title=title)
+        if admission.outcome == AdmissionOutcome.COMPLETED:
+            return await asyncio.to_thread(self._existing_result, admission.document_id)
+        return await self._claim_and_run(
+            admission.document_id, title=title, on_stage_update=on_stage_update
+        )
 
-        if isinstance(source, int):
-            document_id = source
-        else:
-            if mode is not None:
-                raise PipelineError(
-                    "reprocess_mode can only be used when source is an existing document ID"
-                )
-            admission = await asyncio.to_thread(self.admit, source, title=title)
-            if admission.outcome == AdmissionOutcome.COMPLETED:
-                return await asyncio.to_thread(self._existing_result, admission.document_id)
-            document_id = admission.document_id
+    async def resume(
+        self,
+        document_id: int,
+        *,
+        title: Optional[str] = None,
+        on_stage_update: Optional[StageCallback] = None,
+    ) -> IngestionResult:
+        """Finish a document that never completed, reusing its stored markdown
+        when an earlier attempt got that far. A COMPLETED document runs
+        nothing and is reported with ``already_completed=True``.
 
-        run = await asyncio.to_thread(
-            claim_document,
-            self.database,
+        Raises:
+            DocumentNotFoundError: No such document.
+            DocumentBusyError: Another run is processing the document.
+            ProcessingLeaseLostError: As for ``ingest``.
+        """
+        await asyncio.to_thread(self._check_same_database)
+        return await self._claim_and_run(document_id, title=title, on_stage_update=on_stage_update)
+
+    async def reprocess(
+        self,
+        document_id: int,
+        mode: ReprocessMode,
+        *,
+        clear_markdown: bool = False,
+        on_stage_update: Optional[StageCallback] = None,
+    ) -> IngestionResult:
+        """Rebuild a document, replacing its published version.
+
+        If the run fails, the previous chunks and vectors stay published.
+
+        Args:
+            document_id: The document to rebuild
+            mode: Where the rebuild starts:
+                - FULL: from the source (parse, chunk, embed, publish)
+                - FROM_CHUNKING: from the stored markdown
+                - FROM_EMBEDDING: from the stored chunks, keeping their UUIDs
+            clear_markdown: Clear the stored markdown first (FULL only)
+            on_stage_update: As for ``ingest``
+
+        Raises:
+            PipelineError: clear_markdown with a mode other than FULL.
+            DocumentNotFoundError, DocumentBusyError, ProcessingLeaseLostError:
+                As for ``resume``.
+        """
+        if clear_markdown and mode != ReprocessMode.FULL:
+            raise PipelineError("clear_markdown is only supported with ReprocessMode.FULL")
+        await asyncio.to_thread(self._check_same_database)
+        return await self._claim_and_run(
             document_id,
-            title=title,
             mode=mode,
             clear_markdown=clear_markdown,
-            lease_seconds=self.lease_seconds,
-            configured_collection=self.vector_store_config.collection_name,
-            vector_store_manager=(
-                self.vector_store_manager if self.enable_database_persistence else None
-            ),
+            on_stage_update=on_stage_update,
         )
-        if run is None:
-            return await asyncio.to_thread(self._existing_result, document_id)
-        return await self._run_pipeline(run, mode, on_stage_update)
 
     def admit(
         self,
@@ -225,6 +224,34 @@ class IngestionOrchestrator:
     # ------------------------------------------------------------------
     # Before the pipeline
     # ------------------------------------------------------------------
+
+    async def _claim_and_run(
+        self,
+        document_id: int,
+        *,
+        title: Optional[str] = None,
+        mode: Optional[ReprocessMode] = None,
+        clear_markdown: bool = False,
+        on_stage_update: Optional[StageCallback] = None,
+    ) -> IngestionResult:
+        """Claim the document and run the pipeline on it, or report it as
+        already completed when there is nothing to run."""
+        run = await asyncio.to_thread(
+            claim_document,
+            self.database,
+            document_id,
+            title=title,
+            mode=mode,
+            clear_markdown=clear_markdown,
+            lease_seconds=self.lease_seconds,
+            configured_collection=self.vector_store_config.collection_name,
+            vector_store_manager=(
+                self.vector_store_manager if self.enable_database_persistence else None
+            ),
+        )
+        if run is None:
+            return await asyncio.to_thread(self._existing_result, document_id)
+        return await self._run_pipeline(run, mode, on_stage_update)
 
     def _check_same_database(self) -> None:
         """Vectors and documents must be written to the same database."""
@@ -281,7 +308,7 @@ class IngestionOrchestrator:
         self,
         run: PreparedRun,
         mode: Optional[ReprocessMode],
-        on_stage_update: Optional[Callable[[str, StageStatus], None]],
+        on_stage_update: Optional[StageCallback],
     ) -> IngestionResult:
         """Run the stages on a claimed document and report the outcome."""
         recorder = StatusRecorder(

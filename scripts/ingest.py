@@ -137,12 +137,12 @@ async def ingest_document(
         doc_id = int(source)
         if verbose:
             print(f"Resuming document ID: {doc_id}\n")
-        result = await orchestrator.process(
-            source=doc_id,
-            title=title,
-            reprocess_mode=reprocess_mode,
-            clear_markdown=clear_markdown,
-        )
+        if reprocess_mode:
+            result = await orchestrator.reprocess(
+                doc_id, ReprocessMode.parse(reprocess_mode), clear_markdown=clear_markdown
+            )
+        else:
+            result = await orchestrator.resume(doc_id, title=title)
     except ValueError:
         # It's a file path or URL
         if reprocess_mode:
@@ -152,7 +152,7 @@ async def ingest_document(
             print_document_info(0, source, title or Path(source).stem)
             print("\nStarting ingestion pipeline...\n")
 
-        result = await orchestrator.process(source=source, title=title)
+        result = await orchestrator.ingest(source, title=title)
 
     if verbose:
         print_results(result, verbose=True)

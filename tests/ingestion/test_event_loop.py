@@ -45,7 +45,7 @@ async def test_a_run_does_its_blocking_work_off_the_event_loop(
         calls,
     )
 
-    result = await orchestrator.process(SOURCE)
+    result = await orchestrator.ingest(SOURCE)
 
     assert result["success"] is True
     assert {name for name, _ in calls} == {
@@ -63,6 +63,6 @@ async def test_a_run_does_its_blocking_work_off_the_event_loop(
 async def test_the_callers_progress_callback_stays_on_the_event_loop(orchestrator):
     seen: List[bool] = []
 
-    await orchestrator.process(SOURCE, on_stage_update=lambda *_: seen.append(_on_event_loop()))
+    await orchestrator.ingest(SOURCE, on_stage_update=lambda *_: seen.append(_on_event_loop()))
 
     assert seen and all(seen)

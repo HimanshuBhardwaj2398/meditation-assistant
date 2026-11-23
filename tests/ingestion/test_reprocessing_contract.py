@@ -9,15 +9,16 @@ import pytest
 from core.interfaces import ParseResult, PipelineContext, StageStatus
 from db.schema import Document as DbDocument
 from ingestion.admission import admit
+from ingestion.claim import ReprocessMode
 from ingestion.stages import ParsingStage
 from tests.ingestion.conftest import PROVENANCE, SOURCE
 
 
-@pytest.mark.parametrize("mode", ["from_chunking", "from_embedding"])
+@pytest.mark.parametrize("mode", [ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING])
 async def test_reprocessing_preserves_source_metadata_in_vectors(
     orchestrator, parser, vectors, monkeypatch, mode
 ):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     embedded: list = []
     compute = vectors.compute_embeddings
 
@@ -27,7 +28,7 @@ async def test_reprocessing_preserves_source_metadata_in_vectors(
 
     monkeypatch.setattr(vectors, "compute_embeddings", capture)
 
-    result = await orchestrator.process(first["document_id"], reprocess_mode=mode)
+    result = await orchestrator.reprocess(first["document_id"], mode)
 
     assert result["success"] is True
     assert parser.calls == [SOURCE]  # the reprocess did not parse again
@@ -97,7 +98,7 @@ async def test_collection_reprocess_propagates_pipeline_outcome(
     monkeypatch.setattr(service, "session_scope", lambda: nullcontext(MagicMock()))
     monkeypatch.setattr(service, "DocumentCRUD", lambda session: document_crud)
     monkeypatch.setattr(service, "ChunkCRUD", lambda session: chunk_crud)
-    orchestrator = SimpleNamespace(process=AsyncMock(return_value=pipeline_result))
+    orchestrator = SimpleNamespace(reprocess=AsyncMock(return_value=pipeline_result))
     monkeypatch.setattr(service, "IngestionOrchestrator", lambda **kwargs: orchestrator)
 
     result = await service.CollectionService(db_url="postgresql://test/test").reprocess_document(7)

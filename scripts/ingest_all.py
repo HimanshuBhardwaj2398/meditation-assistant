@@ -130,7 +130,7 @@ async def _run_shard(
                 # Admission maps the source to its document every attempt: a
                 # row left by a failed attempt is resumed (reusing its stored
                 # markdown), never inserted twice.
-                result = await orchestrator.process(source)
+                result = await orchestrator.ingest(source)
 
                 if not result.get("success"):
                     raise RuntimeError(

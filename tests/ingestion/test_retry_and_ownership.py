@@ -22,6 +22,7 @@ from core.interfaces import PipelineContext
 from db.crud import DocumentCRUD
 from db.schema import Chunk, Document, DocumentStatus
 from ingestion.admission import admit
+from ingestion.claim import ReprocessMode
 from ingestion.stages import DatabasePersistenceStage, ParsingStage
 from tests.ingestion.conftest import SOURCE
 from tests.ingestion.test_orchestrator_e2e import assert_published_in_step, snapshot
@@ -41,10 +42,10 @@ def claim_of(db, document_id):
 
 
 async def test_resubmitting_a_completed_source_runs_nothing(orchestrator, parser, vectors):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
 
-    again = await orchestrator.process("https://suttacentral.net/MN1/en/sujato")
-    by_id = await orchestrator.process(first["document_id"])
+    again = await orchestrator.ingest("https://suttacentral.net/MN1/en/sujato")
+    by_id = await orchestrator.resume(first["document_id"])
 
     for result in (again, by_id):
         assert result["success"] is True
@@ -60,12 +61,12 @@ async def test_a_retry_resumes_the_same_document_from_its_stored_markdown(
     orchestrator, ingest_db, parser, vectors
 ):
     vectors.fail_next = EmbeddingError("provider down")
-    failed = await orchestrator.process(SOURCE)
+    failed = await orchestrator.ingest(SOURCE)
     assert failed["success"] is False
     assert snapshot(ingest_db, failed["document_id"]).status == DocumentStatus.FAILED
     assert claim_of(ingest_db, failed["document_id"]) is None
 
-    retried = await orchestrator.process("sc:MN1/sujato")
+    retried = await orchestrator.ingest("sc:MN1/sujato")
 
     assert retried["success"] is True, retried["errors"]
     assert retried["document_id"] == failed["document_id"]
@@ -80,9 +81,9 @@ async def test_a_document_another_run_is_processing_is_busy(orchestrator, ingest
     hold_claim(ingest_db, admission.document_id, "other-run")
 
     with pytest.raises(DocumentBusyError):
-        await orchestrator.process(admission.document_id)
+        await orchestrator.resume(admission.document_id)
     with pytest.raises(DocumentBusyError):
-        await orchestrator.process(SOURCE)
+        await orchestrator.ingest(SOURCE)
 
     assert parser.calls == []
     assert claim_of(ingest_db, admission.document_id) == "other-run"
@@ -97,7 +98,7 @@ async def test_a_dead_runs_claim_lapses_after_the_lease(orchestrator, ingest_db)
         age=timedelta(seconds=orchestrator.lease_seconds + 60),
     )
 
-    result = await orchestrator.process(admission.document_id)
+    result = await orchestrator.resume(admission.document_id)
 
     assert result["success"] is True, result["errors"]
     assert claim_of(ingest_db, admission.document_id) is None
@@ -112,7 +113,7 @@ async def test_a_run_that_is_taken_over_stops_without_writing(orchestrator, inge
     vectors.before_embedding = another_run_takes_over
 
     with pytest.raises(ProcessingLeaseLostError):
-        await orchestrator.process(SOURCE)
+        await orchestrator.ingest(SOURCE)
 
     state = snapshot(ingest_db, admission.document_id)
     assert state.uuids == []
@@ -163,7 +164,7 @@ async def test_storing_parsed_markdown_requires_the_runs_claim(ingest_db, parser
 async def test_a_failed_reprocess_keeps_the_published_version(
     orchestrator, ingest_db, vectors, monkeypatch
 ):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     before = snapshot(ingest_db, document_id)
     vectors_before = vectors.rows()
@@ -173,7 +174,7 @@ async def test_a_failed_reprocess_keeps_the_published_version(
 
     with monkeypatch.context() as patch:
         patch.setattr(DocumentCRUD, "clear_chunks", interrupt)
-        result = await orchestrator.process(document_id, reprocess_mode="from_chunking")
+        result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_CHUNKING)
 
     assert result["success"] is False
     assert result["errors"]["database_persistence"] == "publication interrupted"
@@ -191,11 +192,11 @@ async def test_a_failed_reprocess_keeps_the_published_version(
 
 
 async def test_reprocess_from_embedding_keeps_chunk_ids(orchestrator, ingest_db, vectors):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     before = snapshot(ingest_db, document_id)
 
-    result = await orchestrator.process(document_id, reprocess_mode="from_embedding")
+    result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_EMBEDDING)
 
     assert result["success"] is True, result["errors"]
     after = snapshot(ingest_db, document_id)
@@ -205,7 +206,7 @@ async def test_reprocess_from_embedding_keeps_chunk_ids(orchestrator, ingest_db,
 
 
 async def test_a_reprocess_removes_vectors_older_runs_left_behind(orchestrator, ingest_db, vectors):
-    first = await orchestrator.process(SOURCE)
+    first = await orchestrator.ingest(SOURCE)
     document_id = first["document_id"]
     with ingest_db.session_scope() as session:
         session.execute(
@@ -216,7 +217,7 @@ async def test_a_reprocess_removes_vectors_older_runs_left_behind(orchestrator, 
             {"document_id": document_id},
         )
 
-    result = await orchestrator.process(document_id, reprocess_mode="from_chunking")
+    result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_CHUNKING)
 
     assert result["success"] is True, result["errors"]
     state = snapshot(ingest_db, document_id)

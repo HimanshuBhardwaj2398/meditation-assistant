@@ -45,7 +45,7 @@ async def _ingest_all(
         # Admission decides: new sources run, completed ones are skipped,
         # and ones that failed before resume.
         try:
-            result = await orchestrator.process(source)
+            result = await orchestrator.ingest(source)
         except DocumentBusyError as e:
             print(f"skip (another run is processing it): {source}: {e}")
             success = False

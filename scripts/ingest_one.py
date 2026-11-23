@@ -50,7 +50,7 @@ def main(argv: list[str]) -> None:
     )
 
     print(f"Ingesting {source!r} into collection {collection!r} ...")
-    result = asyncio.run(orchestrator.process(source))
+    result = asyncio.run(orchestrator.ingest(source))
 
     print("\n=== Ingestion result ===")
     print(f"document_id : {result['document_id']}")

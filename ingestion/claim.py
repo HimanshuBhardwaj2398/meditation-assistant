@@ -39,6 +39,21 @@ class ReprocessMode(str, Enum):
     FROM_CHUNKING = "from_chunking"
     FROM_EMBEDDING = "from_embedding"
 
+    @classmethod
+    def parse(cls, value: str) -> "ReprocessMode":
+        """The mode a CLI flag or UI choice names.
+
+        Raises:
+            PipelineError: For a value that names no mode.
+        """
+        try:
+            return cls(value)
+        except ValueError as e:
+            allowed = ", ".join(mode.value for mode in cls)
+            raise PipelineError(
+                f"Invalid reprocess mode {value!r}. Allowed values: {allowed}"
+            ) from e
+
 
 @dataclass
 class PreparedRun:

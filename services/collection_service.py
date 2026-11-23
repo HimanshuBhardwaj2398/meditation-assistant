@@ -15,7 +15,7 @@ from core.exceptions import DocumentNotFoundError
 from db.crud import ChunkCRUD, DocumentCRUD, get_all_collections
 from db.database import session_scope
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
-from ingestion.orchestrator import IngestionOrchestrator
+from ingestion.orchestrator import IngestionOrchestrator, ReprocessMode
 
 logger = logging.getLogger(__name__)
 
@@ -267,10 +267,7 @@ class CollectionService:
                     db_url=self.db_url,
                 )
             )
-            result = await orchestrator.process(
-                source=document_id,
-                reprocess_mode="from_chunking",
-            )
+            result = await orchestrator.reprocess(document_id, ReprocessMode.FROM_CHUNKING)
 
             success = bool(result.get("success"))
             new_chunk_count = result.get("chunk_count", 0) if success else 0
