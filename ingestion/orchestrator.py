@@ -23,7 +23,7 @@ from core.exceptions import (
     PipelineError,
     ProcessingLeaseLostError,
 )
-from core.interfaces import PipelineContext, PipelineStage, StageStatus
+from core.interfaces import PipelineContext, PipelineStage, StageName, StageStatus
 from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
@@ -546,7 +546,7 @@ class IngestionOrchestrator:
                     f"Document {doc.id} has no stored markdown; cannot start from chunking"
                 )
             run.parsed_content = doc.markdown
-            run.stage_results = {"parsing": StageStatus.COMPLETED}
+            run.stage_results = {StageName.PARSING: StageStatus.COMPLETED}
         elif mode == ReprocessMode.FROM_EMBEDDING:
             existing_chunks = chunk_crud.get_chunks_by_document(doc.id)
             if not existing_chunks:
@@ -554,8 +554,8 @@ class IngestionOrchestrator:
                     f"Document {doc.id} has no stored chunks; cannot start from embedding"
                 )
             run.stage_results = {
-                "parsing": StageStatus.COMPLETED,
-                "chunking": StageStatus.COMPLETED,
+                StageName.PARSING: StageStatus.COMPLETED,
+                StageName.CHUNKING: StageStatus.COMPLETED,
             }
             for chunk_row in existing_chunks:
                 metadata = dict(chunk_row.chunk_metadata or {})
@@ -609,9 +609,11 @@ class IngestionOrchestrator:
         return stages
 
     @property
-    def _final_stage(self) -> str:
+    def _final_stage(self) -> StageName:
         """The stage whose completion means the document is done."""
-        return "database_persistence" if self.enable_database_persistence else "embedding"
+        if self.enable_database_persistence:
+            return StageName.DATABASE_PERSISTENCE
+        return StageName.EMBEDDING
 
     async def _run_pipeline(
         self,

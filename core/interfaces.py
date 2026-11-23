@@ -7,7 +7,7 @@ and ABC (abstract base classes) for key components of the ingestion pipeline.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any, Dict, List, Optional, Protocol
 
 from langchain_core.documents import Document as LangchainDocument
@@ -72,6 +72,20 @@ class Parser(Protocol):
 # ============================================================================
 # PIPELINE INTERFACES
 # ============================================================================
+
+
+class StageName(StrEnum):
+    """Names of the ingestion pipeline stages.
+
+    A ``StrEnum``, so members compare and hash equal to their plain strings:
+    ``stage_results["parsing"]`` and ``stage_results[StageName.PARSING]`` are
+    the same entry, and formatting a member gives its value.
+    """
+
+    PARSING = "parsing"
+    CHUNKING = "chunking"
+    EMBEDDING = "embedding"
+    DATABASE_PERSISTENCE = "database_persistence"
 
 
 class StageStatus(Enum):
@@ -198,7 +212,7 @@ class PipelineStage(ABC):
         Unique name for this stage.
 
         Returns:
-            Stage identifier (e.g., "parsing", "chunking", "embedding")
+            Stage identifier; the ingestion stages return a ``StageName``
         """
         pass
 
@@ -214,7 +228,7 @@ class PipelineStage(ABC):
 
         Example:
             For a chunking stage that requires parsing:
-            return ["parsing"]
+            return [StageName.PARSING]
         """
         return []
 

@@ -20,7 +20,7 @@ from core.exceptions import (
     ParsingError,
     ProcessingLeaseLostError,
 )
-from core.interfaces import PipelineContext, PipelineStage
+from core.interfaces import PipelineContext, PipelineStage, StageName
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.chunking import MarkdownChunker
 from ingestion.embed import VectorStoreManager
@@ -74,7 +74,7 @@ class ParsingStage(PipelineStage):
 
     @property
     def name(self) -> str:
-        return "parsing"
+        return StageName.PARSING
 
     @property
     def required_stages(self) -> List[str]:
@@ -158,11 +158,11 @@ class ChunkingStage(PipelineStage):
 
     @property
     def name(self) -> str:
-        return "chunking"
+        return StageName.CHUNKING
 
     @property
     def required_stages(self) -> List[str]:
-        return ["parsing"]
+        return [StageName.PARSING]
 
     async def execute(self, context: PipelineContext) -> PipelineContext:
         """
@@ -215,11 +215,11 @@ class EmbeddingStage(PipelineStage):
 
     @property
     def name(self) -> str:
-        return "embedding"
+        return StageName.EMBEDDING
 
     @property
     def required_stages(self) -> List[str]:
-        return ["chunking"]
+        return [StageName.CHUNKING]
 
     async def execute(self, context: PipelineContext) -> PipelineContext:
         """
@@ -301,11 +301,11 @@ class DatabasePersistenceStage(PipelineStage):
 
     @property
     def name(self) -> str:
-        return "database_persistence"
+        return StageName.DATABASE_PERSISTENCE
 
     @property
     def required_stages(self) -> List[str]:
-        return ["embedding"]
+        return [StageName.EMBEDDING]
 
     def _build_table_of_contents(self, chunks: List) -> dict:
         """

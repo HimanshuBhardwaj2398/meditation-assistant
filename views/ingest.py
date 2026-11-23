@@ -10,7 +10,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from core.interfaces import StageStatus
+from core.interfaces import StageName, StageStatus
 from db.crud import get_all_collections
 from db.database import session_scope
 from services.ingestion_service import ingest_document
@@ -146,15 +146,14 @@ def render():
             st.error("Please select or create a collection")
         else:
             with st.status("Processing document...", expanded=True) as status_container:
-                stage_names = ["parsing", "chunking", "embedding", "database_persistence"]
                 stage_labels = {
-                    "parsing": "Parsing",
-                    "chunking": "Chunking",
-                    "embedding": "Embedding",
-                    "database_persistence": "Persistence",
+                    StageName.PARSING: "Parsing",
+                    StageName.CHUNKING: "Chunking",
+                    StageName.EMBEDDING: "Embedding",
+                    StageName.DATABASE_PERSISTENCE: "Persistence",
                 }
                 stage_placeholders = {}
-                for stage_name in stage_names:
+                for stage_name in StageName:
                     stage_placeholders[stage_name] = st.empty()
                     stage_placeholders[stage_name].markdown(
                         f"⏳ **{stage_labels[stage_name]}** - Pending"
