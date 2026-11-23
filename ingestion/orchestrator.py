@@ -6,6 +6,7 @@ resume or reprocess), runs the stage pipeline on it (``ingestion.pipeline``),
 and records progress in ``documents.status``.
 """
 
+import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
@@ -156,7 +157,9 @@ class IngestionOrchestrator:
         if clear_markdown and mode != ReprocessMode.FULL:
             raise PipelineError("clear_markdown is only supported with reprocess_mode='full'")
 
-        self._check_same_database()
+        # Admission, claiming and status writes are database round trips: they
+        # run in worker threads, like the stages, to keep the event loop free.
+        await asyncio.to_thread(self._check_same_database)
 
         if isinstance(source, int):
             document_id = source
@@ -165,12 +168,13 @@ class IngestionOrchestrator:
                 raise PipelineError(
                     "reprocess_mode can only be used when source is an existing document ID"
                 )
-            admission = self.admit(source, title=title)
+            admission = await asyncio.to_thread(self.admit, source, title=title)
             if admission.outcome == AdmissionOutcome.COMPLETED:
-                return self._existing_result(admission.document_id)
+                return await asyncio.to_thread(self._existing_result, admission.document_id)
             document_id = admission.document_id
 
-        run = claim_document(
+        run = await asyncio.to_thread(
+            claim_document,
             document_id,
             title=title,
             mode=mode,
@@ -182,7 +186,7 @@ class IngestionOrchestrator:
             ),
         )
         if run is None:
-            return self._existing_result(document_id)
+            return await asyncio.to_thread(self._existing_result, document_id)
         return await self._run_pipeline(run, mode, on_stage_update)
 
     def admit(
@@ -276,8 +280,9 @@ class IngestionOrchestrator:
             run.document_id, run.token, replacing=run.replacing, current=run.start_status
         )
 
-        def _on_stage_update(stage_name: str, stage_status: StageStatus) -> None:
-            recorder.record(stage_name, stage_status)
+        async def _on_stage_update(stage_name: str, stage_status: StageStatus) -> None:
+            await asyncio.to_thread(recorder.record, stage_name, stage_status)
+            # The caller's callback stays on the event loop (Streamlit needs that).
             if on_stage_update is not None:
                 on_stage_update(stage_name, stage_status)
 
@@ -317,7 +322,7 @@ class IngestionOrchestrator:
                 logger.info(f"Pipeline completed successfully for document {run.document_id}")
             else:
                 logger.warning(f"Pipeline partially completed for document {run.document_id}")
-                recorder.finish_failed(str(final_context.error_messages))
+                await asyncio.to_thread(recorder.finish_failed, str(final_context.error_messages))
 
             return result
 
@@ -328,5 +333,5 @@ class IngestionOrchestrator:
             raise
         except Exception as e:
             logger.error(f"Pipeline failed for document {run.document_id}: {e}", exc_info=True)
-            recorder.finish_failed(str(e))
+            await asyncio.to_thread(recorder.finish_failed, str(e))
             raise PipelineError(f"Pipeline execution failed: {e}") from e

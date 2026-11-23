@@ -1,6 +1,5 @@
 """Tests for chunk metadata restructure."""
 
-import pytest
 from langchain.schema import Document
 
 from ingestion.chunking import Config, MarkdownChunker
@@ -222,8 +221,7 @@ class TestBuildTableOfContents:
 class TestSplitOversizedChunks:
     """Tests for order stability during semantic split."""
 
-    @pytest.mark.asyncio
-    async def test_preserves_order_when_first_chunk_is_oversized(self):
+    def test_preserves_order_when_first_chunk_is_oversized(self):
         chunker = MarkdownChunker(
             text="# Test\nx",
             config=Config(
@@ -257,7 +255,7 @@ class TestSplitOversizedChunks:
 
         chunker._semantic_split = fake_semantic_split
 
-        result = await chunker._split_oversized_chunks([oversized, normal])
+        result = chunker._split_oversized_chunks([oversized, normal])
         assert [doc.page_content for doc in result] == [
             "split-part-1",
             "split-part-2",

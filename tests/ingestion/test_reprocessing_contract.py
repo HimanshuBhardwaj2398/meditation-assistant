@@ -46,7 +46,7 @@ async def test_reprocessing_preserves_source_metadata_in_vectors(monkeypatch, mo
     monkeypatch.setattr(crud, "DocumentCRUD", lambda session: document_crud)
     monkeypatch.setattr(crud, "ChunkCRUD", lambda session: chunk_crud)
     chunker = MagicMock()
-    chunker.chunk = AsyncMock(
+    chunker.chunk = MagicMock(
         return_value=(
             [Document(page_content="Regenerated chunk")],
             SimpleNamespace(total_chunks=1, processing_time=0, avg_chunk_size=2),

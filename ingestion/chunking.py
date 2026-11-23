@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import re
 import threading
@@ -223,19 +222,19 @@ class MarkdownChunker:
 
         return headers
 
-    async def chunk(self) -> Tuple[List[Document], ChunkingStats]:
+    def chunk(self) -> Tuple[List[Document], ChunkingStats]:
         """Execute chunking pipeline."""
         start_time = time.time()
 
         try:
             # Step 1: Split by headers
-            chunks = await self._split_by_headers()
+            chunks = self._split_by_headers()
 
             logger.info(f"Initial split by headers: {len(chunks)} chunks created.")
 
             # Step 2: Split oversized chunks semantically (if enabled)
             if self.config.enable_semantic:
-                chunks = await self._split_oversized_chunks(chunks)
+                chunks = self._split_oversized_chunks(chunks)
 
             logger.info(f"After semantic splitting: {len(chunks)} chunks created.")
 
@@ -262,7 +261,7 @@ class MarkdownChunker:
         except Exception as e:
             raise ChunkingError(f"Chunking failed: {e}") from e
 
-    async def _split_by_headers(self) -> List[Document]:
+    def _split_by_headers(self) -> List[Document]:
         """Split text by markdown headers."""
         headers_to_split = [
             (f"{'#' * i}", f"Header {i}") for i in range(1, self.config.max_header_level + 1)
@@ -280,53 +279,27 @@ class MarkdownChunker:
 
         return docs
 
-    async def _split_oversized_chunks(self, chunks: List[Document]) -> List[Document]:
-        """Split chunks that exceed max_size using semantic splitting."""
-        oversized_indices = [
-            idx
-            for idx, chunk in enumerate(chunks)
-            if len(chunk.page_content) > self.config.max_size
-        ]
-        if not oversized_indices:
+    def _split_oversized_chunks(self, chunks: List[Document]) -> List[Document]:
+        """Split chunks longer than max_size semantically, keeping document order."""
+        oversized = [chunk for chunk in chunks if len(chunk.page_content) > self.config.max_size]
+        if not oversized:
             return chunks
 
-        split_results: Dict[int, List[Document]] = {}
-
-        if self.config.enable_parallel and len(oversized_indices) > 1:
-            # Process oversized chunks in parallel
-            loop = asyncio.get_running_loop()
-            oversized = [chunks[idx] for idx in oversized_indices]
+        if self.config.enable_parallel and len(oversized) > 1:
             with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-                tasks = [
-                    loop.run_in_executor(executor, self._semantic_split, chunk)
-                    for chunk in oversized
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Collect results while preserving original chunk order
-            for i, result in enumerate(results):
-                original_idx = oversized_indices[i]
-                if isinstance(result, Exception):
-                    logger.warning(f"Semantic split failed for chunk {i}: {result}")
-                    split_results[original_idx] = [chunks[original_idx]]
-                else:
-                    split_results[original_idx] = result or [chunks[original_idx]]
+                pieces = list(executor.map(self._semantic_split, oversized))
         else:
-            # Process sequentially
-            for idx in oversized_indices:
-                result = self._semantic_split(chunks[idx])
-                split_results[idx] = result or [chunks[idx]]
+            pieces = [self._semantic_split(chunk) for chunk in oversized]
 
-        ordered_chunks: List[Document] = []
-        oversized_idx_set = set(oversized_indices)
-
-        for idx, chunk in enumerate(chunks):
-            if idx in oversized_idx_set:
-                ordered_chunks.extend(split_results.get(idx, [chunk]))
+        # _semantic_split never raises and returns at least the chunk itself.
+        replacements = iter(pieces)
+        ordered: List[Document] = []
+        for chunk in chunks:
+            if len(chunk.page_content) > self.config.max_size:
+                ordered.extend(next(replacements))
             else:
-                ordered_chunks.append(chunk)
-
-        return ordered_chunks
+                ordered.append(chunk)
+        return ordered
 
     def _semantic_split(self, chunk: Document) -> List[Document]:
         """Split a single chunk using semantic chunking.

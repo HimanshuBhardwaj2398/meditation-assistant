@@ -72,7 +72,7 @@ def test_combining_accumulates_characters_and_stops_at_min_size():
     assert len(merged[0].page_content) == 192
 
 
-async def test_a_header_splitter_error_fails_chunking(monkeypatch):
+def test_a_header_splitter_error_fails_chunking(monkeypatch):
     """A broken header split is a bug, not one big chunk passed off as success."""
     import pytest
 
@@ -89,7 +89,7 @@ async def test_a_header_splitter_error_fails_chunking(monkeypatch):
     monkeypatch.setattr(chunking, "MarkdownHeaderTextSplitter", BrokenSplitter)
 
     with pytest.raises(ChunkingError, match="splitter exploded"):
-        await make_chunker().chunk()
+        make_chunker().chunk()
 
 
 def test_a_failed_semantic_split_keeps_the_chunk_and_flags_it():

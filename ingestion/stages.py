@@ -6,8 +6,10 @@ return an updated context. A stage that cannot finish raises; the pipeline
 orchestrator is the one place that turns an exception into a FAILED stage.
 """
 
+import asyncio
 import logging
 import uuid as uuid_lib
+from abc import abstractmethod
 from typing import TYPE_CHECKING, List
 
 from langchain_core.documents import Document as LangchainDocument
@@ -76,12 +78,27 @@ def _load_owned_document(doc_crud: "DocumentCRUD", context: PipelineContext) -> 
     return doc
 
 
+class _BlockingStage(PipelineStage):
+    """A stage whose work blocks: network calls, models, database round trips.
+
+    ``execute`` runs ``run`` in a worker thread, so the event loop stays free
+    and documents a caller runs concurrently do not wait on each other.
+    """
+
+    async def execute(self, context: PipelineContext) -> PipelineContext:
+        return await asyncio.to_thread(self.run, context)
+
+    @abstractmethod
+    def run(self, context: PipelineContext) -> PipelineContext:
+        """Do the stage's work; raise if it cannot finish."""
+
+
 # ============================================================================
 # STAGE 1: PARSING
 # ============================================================================
 
 
-class ParsingStage(PipelineStage):
+class ParsingStage(_BlockingStage):
     """
     Stage 1: Parse source document into markdown.
 
@@ -107,7 +124,7 @@ class ParsingStage(PipelineStage):
     def required_stages(self) -> List[str]:
         return []  # No dependencies
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
+    def run(self, context: PipelineContext) -> PipelineContext:
         """
         Parse source document and update context.
 
@@ -165,7 +182,7 @@ class ParsingStage(PipelineStage):
 # ============================================================================
 
 
-class ChunkingStage(PipelineStage):
+class ChunkingStage(_BlockingStage):
     """
     Stage 2: Chunk parsed markdown into semantic segments.
 
@@ -191,7 +208,7 @@ class ChunkingStage(PipelineStage):
     def required_stages(self) -> List[str]:
         return [StageName.PARSING]
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
+    def run(self, context: PipelineContext) -> PipelineContext:
         """
         Chunk parsed content into semantic segments.
 
@@ -212,7 +229,7 @@ class ChunkingStage(PipelineStage):
         chunker = MarkdownChunker(
             text=context.parsed_content, config=self.chunking_config, title=context.title
         )
-        chunks, stats = await chunker.chunk()
+        chunks, stats = chunker.chunk()
 
         logger.info(
             f"Chunking complete: {stats.total_chunks} chunks in "
@@ -227,7 +244,7 @@ class ChunkingStage(PipelineStage):
 # ============================================================================
 
 
-class EmbeddingStage(PipelineStage):
+class EmbeddingStage(_BlockingStage):
     """
     Stage 3: Compute vectors for chunks.
 
@@ -248,7 +265,7 @@ class EmbeddingStage(PipelineStage):
     def required_stages(self) -> List[str]:
         return [StageName.CHUNKING]
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
+    def run(self, context: PipelineContext) -> PipelineContext:
         """
         Compute vectors and attach the chunk IDs used by both tables.
 
@@ -314,7 +331,7 @@ class EmbeddingStage(PipelineStage):
 # ============================================================================
 
 
-class DatabasePersistenceStage(PipelineStage):
+class DatabasePersistenceStage(_BlockingStage):
     """
     Stage 4: Publish vectors and relational metadata together.
 
@@ -399,7 +416,7 @@ class DatabasePersistenceStage(PipelineStage):
             "text": "\n".join(text_lines),
         }
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
+    def run(self, context: PipelineContext) -> PipelineContext:
         """
         Publish the document: its vectors, chunk rows, table of contents and
         COMPLETED status, in one transaction.
