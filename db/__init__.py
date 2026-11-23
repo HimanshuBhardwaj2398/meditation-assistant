@@ -1,5 +1,5 @@
 from .crud import DocumentCRUD
-from .database import get_db, init_db, session_scope
+from .database import get_db, session_scope
 from .schema import Document, DocumentStatus
 
 __all__ = [
@@ -7,6 +7,5 @@ __all__ = [
     "DocumentCRUD",
     "DocumentStatus",
     "get_db",
-    "init_db",
     "session_scope",
 ]

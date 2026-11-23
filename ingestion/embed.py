@@ -134,7 +134,7 @@ class VectorStoreManager:
             # engine of its own. Vector writes and deletes go through the app's
             # session, so that engine is only needed here: NullPool closes its
             # connection afterwards instead of keeping one open on Neon. The
-            # pgvector extension is the migrations' job (alembic / init_db).
+            # pgvector extension is the migrations' job (alembic upgrade head).
             vector_store = PGVector(
                 connection_string=self.config.db_url,
                 embedding_function=self.embeddings,

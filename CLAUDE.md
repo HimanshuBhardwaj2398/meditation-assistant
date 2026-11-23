@@ -56,7 +56,8 @@ poetry run alembic upgrade head          # create/upgrade the schema
 poetry run streamlit run app.py          # web UI: ingest, monitor, browse, validate
 
 # SuttaCentral CLIs — positional args only (no selection flags).
-# ingest_one.py and ingest_batch.py hard-require NEON_DIRECT_URL in the env/.env.
+# ingest_one.py and ingest_batch.py hard-require NEON_DIRECT_URL in the env/.env,
+# and refuse to run unless that database is at the Alembic head (they never create tables).
 poetry run python scripts/ingest_one.py sc:mn10/sujato
 poetry run python scripts/ingest_batch.py sc:mn1/sujato sc:mn2/sujato
 poetry run python scripts/build_catalog.py dn mn   # -> data/suttacentral_catalog.jsonl
@@ -97,6 +98,10 @@ poetry run python scripts/check_doc_links.py
   hierarchies.
 - **Structured logging** via `config/logging_config.py`; use module-level
   loggers, not `print`.
+- **Alembic owns the schema** — the app never runs `create_all` on a real
+  database; CLIs call `Database.require_current_schema()` to fail fast.
+  `create_all` is for in-memory SQLite in tests only. Run `alembic check`
+  after model changes.
 - **Injectable `Database`** — no import-time engine. Composition roots (e.g.
   the SuttaCentral CLIs) call `set_default_database()` to point the whole
   pipeline at a specific database; tests inject in-memory SQLite.

@@ -48,6 +48,22 @@ if config.config_file_name is not None:
 # This is what Alembic uses to detect schema changes
 target_metadata = Base.metadata
 
+
+def include_object(obj, name, type_, reflected, compare_to):  # type: ignore[no-untyped-def]
+    """Compare only tables our models declare.
+
+    langchain-postgres creates and owns langchain_pg_collection and
+    langchain_pg_embedding. Without this filter, autogenerate sees them in the
+    database but not in Base.metadata and drafts DROP TABLE for both.
+    """
+    if type_ == "table":
+        return name in target_metadata.tables
+    table = getattr(obj, "table", None)
+    if table is not None:
+        return table.name in target_metadata.tables
+    return True
+
+
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")
@@ -74,6 +90,7 @@ def run_migrations_offline() -> None:
         dialect_opts={"paramstyle": "named"},
         compare_type=True,  # Detect column type changes
         compare_server_default=True,  # Detect default value changes
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -98,6 +115,7 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             compare_type=True,  # Detect column type changes
             compare_server_default=True,  # Detect default value changes
+            include_object=include_object,
         )
 
         with context.begin_transaction():

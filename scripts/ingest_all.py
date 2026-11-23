@@ -208,7 +208,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     database = Database(DatabaseSettings(url=neon_url))
     set_default_database(database)
-    database.init_db()
+    database.require_current_schema()  # schema is Alembic's job: alembic upgrade head
 
     sources = load_catalog(include_all_kn=args.include_all_kn)
     fresh, stale = partition_worklist(sources)

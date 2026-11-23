@@ -5,23 +5,28 @@ The engine is owned by a :class:`Database` object constructed on demand rather
 than at import time, so importing this module no longer requires database
 configuration (the seam that makes persistence injectable and testable). A
 lazily-built default ``Database`` (from application settings) backs the
-backward-compatible module-level ``session_scope`` / ``init_db`` / ``get_db``
+backward-compatible module-level ``session_scope`` / ``get_db``
 helpers and the ``engine`` / ``SessionLocal`` attributes.
 """
 
 import logging
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator, Optional
 
-from sqlalchemy import create_engine, text
+from alembic.config import Config as AlembicConfig
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import DatabaseSettings, get_settings
-
-from .schema import Base
+from core.exceptions import SchemaValidationError
 
 logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class Database:
@@ -93,32 +98,30 @@ class Database:
         finally:
             session.close()
 
-    def init_db(self) -> None:
-        """Create the pgvector extension and all tables. Run once per database."""
-        logger.info("Initializing database...")
-        try:
-            with self.engine.connect() as connection:
-                connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                connection.commit()
-                logger.info("pgvector extension enabled")
+    def require_current_schema(self) -> None:
+        """Fail fast unless this database is at the newest Alembic revision.
 
-            Base.metadata.create_all(bind=self.engine)
-            logger.info("Database tables created")
+        Alembic owns the schema (``alembic upgrade head``); the application never
+        creates or alters tables itself. Building tables with ``create_all`` would
+        leave no ``alembic_version`` row, and a later ``upgrade head`` would try to
+        re-create them.
+        """
+        head = alembic_head()
+        with self.engine.connect() as connection:
+            current = MigrationContext.configure(connection).get_current_heads()
+        if current != (head,):
+            at = ", ".join(current) if current else "no Alembic revision"
+            raise SchemaValidationError(
+                f"Database schema is at {at}, expected {head}. "
+                "Run `poetry run alembic upgrade head` against this database first."
+            )
 
-            with self.engine.connect() as connection:
-                result = connection.execute(
-                    text(
-                        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
-                        "ORDER BY tablename"
-                    )
-                )
-                tables = [row[0] for row in result]
-                logger.info(f"Tables in database: {', '.join(tables)}")
 
-            logger.info("Database initialization complete")
-        except Exception as exc:
-            logger.error(f"Database initialization failed: {exc}", exc_info=True)
-            raise
+def alembic_head() -> str:
+    """The newest revision in alembic/versions (the schema the code expects)."""
+    config = AlembicConfig()
+    config.set_main_option("script_location", str(_PROJECT_ROOT / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head() or ""
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +169,6 @@ def get_db() -> Iterator[Session]:
         yield session
     finally:
         session.close()
-
-
-def init_db() -> None:
-    """Initialize the default database (pgvector extension + tables)."""
-    get_database().init_db()
 
 
 def __getattr__(name: str):

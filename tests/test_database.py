@@ -34,3 +34,45 @@ def test_set_default_database_overrides_the_process_default():
         assert get_database() is db
     finally:
         db_module._default_database = original
+
+
+# --- schema gate: Alembic owns the schema; the app only checks it is current ---
+
+import pytest  # noqa: E402
+
+from core.exceptions import SchemaValidationError  # noqa: E402
+
+
+def _file_db(tmp_path) -> Database:
+    return Database(DatabaseSettings(url=f"sqlite+pysqlite:///{tmp_path / 'gate.db'}"))
+
+
+def _stamp(db: Database, revision: str) -> None:
+    with db.engine.begin() as conn:
+        conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        conn.execute(text("INSERT INTO alembic_version VALUES (:r)"), {"r": revision})
+
+
+def test_require_current_schema_passes_at_head(tmp_path):
+    from db.database import alembic_head
+
+    db = _file_db(tmp_path)
+    _stamp(db, alembic_head())
+
+    db.require_current_schema()  # does not raise
+
+
+def test_require_current_schema_rejects_a_database_alembic_never_met(tmp_path):
+    """No alembic_version table: e.g. tables built by create_all. Must not pass."""
+    db = _file_db(tmp_path)
+
+    with pytest.raises(SchemaValidationError, match="alembic upgrade head"):
+        db.require_current_schema()
+
+
+def test_require_current_schema_rejects_a_database_behind_head(tmp_path):
+    db = _file_db(tmp_path)
+    _stamp(db, "1367bf7a9116")  # the initial revision
+
+    with pytest.raises(SchemaValidationError, match="1367bf7a9116"):
+        db.require_current_schema()

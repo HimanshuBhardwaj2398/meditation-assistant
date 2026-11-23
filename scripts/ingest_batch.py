@@ -68,7 +68,7 @@ def main(argv: list[str]) -> None:
 
     database = Database(DatabaseSettings(url=neon_url))
     set_default_database(database)
-    database.init_db()
+    database.require_current_schema()  # schema is Alembic's job: alembic upgrade head
 
     collection = get_settings().vector.collection_name
     print(f"Batch-ingesting {len(sources)} source(s) into {collection!r} ...")
