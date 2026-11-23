@@ -116,12 +116,12 @@ class ParsingStage(_BlockingStage):
         if not context.source:
             raise ParsingError("No source provided in context")
 
-        logger.info(f"Parsing source: {context.source}")
+        logger.info("Parsing source: %s", context.source)
 
         # Use ParserFactory to automatically select parser
         result = self.parser_factory.parse(context.source)
 
-        logger.info(f"Successfully parsed: {context.source} (title: {result.title})")
+        logger.info("Successfully parsed: %s (title: %s)", context.source, result.title)
 
         metadata = result.metadata or {}
         title = context.title or result.title or UNTITLED
@@ -197,7 +197,7 @@ class ChunkingStage(_BlockingStage):
         if not context.parsed_content:
             raise ChunkingError("No parsed content available for chunking")
 
-        logger.info(f"Chunking document: {context.title}")
+        logger.info("Chunking document: %s", context.title)
 
         chunker = MarkdownChunker(
             text=context.parsed_content, config=self.chunking_config, title=context.title
@@ -205,8 +205,10 @@ class ChunkingStage(_BlockingStage):
         chunks, stats = chunker.chunk()
 
         logger.info(
-            f"Chunking complete: {stats.total_chunks} chunks in "
-            f"{stats.processing_time:.2f}s (avg {stats.avg_chunk_size:.0f} words)"
+            "Chunking complete: %s chunks in %.2fs (avg %.0f words)",
+            stats.total_chunks,
+            stats.processing_time,
+            stats.avg_chunk_size,
         )
 
         return context.with_update(chunks=chunks).mark_stage_completed(self.name)
@@ -388,14 +390,14 @@ class DatabasePersistenceStage(_BlockingStage):
                 chunks_data=chunks_data,
             )
 
-            logger.info(f"Saved {len(created_chunks)} chunks to database")
+            logger.info("Saved %s chunks to database", len(created_chunks))
 
             # Build the table of contents from chunk headers, replacing any old one
             toc = build_table_of_contents(context.chunks)
             doc_metadata = dict(doc.doc_metadata or {})
             if toc["entries"]:
                 doc_metadata["table_of_contents"] = toc
-                logger.info(f"Saved table of contents with {len(toc['entries'])} entries")
+                logger.info("Saved table of contents with %s entries", len(toc["entries"]))
             else:
                 doc_metadata.pop("table_of_contents", None)
             doc_crud.update_doc_metadata(context.document_id, doc_metadata, merge=False)

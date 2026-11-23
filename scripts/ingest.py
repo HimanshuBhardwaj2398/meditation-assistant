@@ -213,7 +213,7 @@ async def ingest_batch(
             )
             results.append(result)
         except Exception as e:
-            logger.error(f"Failed to process {source}: {e}")
+            logger.error("Failed to process %s: %s", source, e)
             results.append({"source": source, "success": False, "error": str(e)})
 
     return results
@@ -410,7 +410,7 @@ def main():
         print("\n\nIngestion cancelled by user.")
         sys.exit(130)
     except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
+        logger.error("Fatal error: %s", e, exc_info=True)
         sys.exit(1)
 
 

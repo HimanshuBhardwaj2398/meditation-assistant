@@ -130,7 +130,7 @@ class CollectionService:
         except DocumentNotFoundError:
             raise
         except Exception as e:
-            logger.error(f"Delete failed for document {document_id}; nothing was deleted: {e}")
+            logger.error("Delete failed for document %s; nothing was deleted: %s", document_id, e)
             return DeleteResult(
                 document_id=document_id,
                 title=doc_title,
@@ -141,8 +141,11 @@ class CollectionService:
             )
 
         logger.info(
-            f"Deleted document {document_id} '{doc_title}': "
-            f"{len(chunk_uuids)} chunks, {embeddings_deleted} embeddings"
+            "Deleted document %s '%s': %s chunks, %s embeddings",
+            document_id,
+            doc_title,
+            len(chunk_uuids),
+            embeddings_deleted,
         )
         return DeleteResult(
             document_id=document_id,
@@ -198,7 +201,7 @@ class CollectionService:
                     )
                 )
             except Exception as e:
-                logger.error(f"Unexpected error deleting document {doc_id}: {e}")
+                logger.error("Unexpected error deleting document %s: %s", doc_id, e)
                 results.append(
                     DeleteResult(
                         document_id=doc_id,
@@ -256,8 +259,10 @@ class CollectionService:
             old_chunk_count = len(ChunkCRUD(session).get_chunks_by_document(document_id))
 
         logger.info(
-            f"Reprocessing document {document_id} '{doc_title}' "
-            f"with {old_chunk_count} existing chunks"
+            "Reprocessing document %s '%s' with %s existing chunks",
+            document_id,
+            doc_title,
+            old_chunk_count,
         )
 
         try:
@@ -274,8 +279,9 @@ class CollectionService:
             error = None
             if success:
                 logger.info(
-                    f"Reprocessing complete for document {document_id}: "
-                    f"{new_chunk_count} new chunks created"
+                    "Reprocessing complete for document %s: %s new chunks created",
+                    document_id,
+                    new_chunk_count,
                 )
             else:
                 error = (
@@ -300,7 +306,7 @@ class CollectionService:
             )
 
         except Exception as e:
-            logger.error(f"Reprocessing failed for document {document_id}: {e}")
+            logger.error("Reprocessing failed for document %s: %s", document_id, e)
             return ReprocessResult(
                 document_id=document_id,
                 title=doc_title,

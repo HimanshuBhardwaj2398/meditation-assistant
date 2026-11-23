@@ -44,7 +44,7 @@ class PipelineOrchestrator:
         self._stages = stages
         self._execution_order = self._order(stages)
 
-        logger.debug(f"Pipeline execution order: {[s.name for s in self._execution_order]}")
+        logger.debug("Pipeline execution order: %s", [s.name for s in self._execution_order])
 
     @staticmethod
     def _order(stages: List[PipelineStage]) -> List[PipelineStage]:
@@ -92,7 +92,7 @@ class PipelineOrchestrator:
         for stage in self._execution_order:
             # Skip if already completed
             if stage.should_skip(current_context):
-                logger.info(f"Skipping stage '{stage.name}' (already completed)")
+                logger.info("Skipping stage '%s' (already completed)", stage.name)
                 continue
 
             # Check if dependencies are met
@@ -108,16 +108,16 @@ class PipelineOrchestrator:
                     if current_context.stage_results.get(dep) == StageStatus.FAILED
                 ]
                 if failed:
-                    logger.info(f"Skipping stage '{stage.name}': {failed} failed")
+                    logger.info("Skipping stage '%s': %s failed", stage.name, failed)
                 else:
                     logger.warning(
-                        f"Stage '{stage.name}' cannot run. Missing dependencies: {missing}"
+                        "Stage '%s' cannot run. Missing dependencies: %s", stage.name, missing
                     )
                 continue
 
             # Execute stage. Stages raise when they cannot finish; this is the
             # one place an exception becomes a FAILED stage with its message.
-            logger.info(f"Executing stage: {stage.name}")
+            logger.info("Executing stage: %s", stage.name)
             await _notify(stage.name, StageStatus.RUNNING)
             try:
                 current_context = await stage.execute(current_context)
@@ -135,7 +135,7 @@ class PipelineOrchestrator:
 
             if current_context.stage_results.get(stage.name) == StageStatus.FAILED:
                 error = current_context.error_messages.get(stage.name, "Unknown error")
-                logger.error(f"Stage '{stage.name}' failed: {error}")
+                logger.error("Stage '%s' failed: %s", stage.name, error)
                 await _notify(stage.name, StageStatus.FAILED)
                 # Later stages that depend on this one are skipped below.
             else:
