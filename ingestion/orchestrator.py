@@ -1,232 +1,33 @@
 """
 Document ingestion orchestration.
 
-``PipelineOrchestrator`` runs stages in dependency order. ``IngestionOrchestrator``
-prepares one document (creates it, or loads it to resume or reprocess), runs the
-pipeline on it, and records progress in ``documents.status``.
+``IngestionOrchestrator`` prepares one document (creates it, or loads it to
+resume or reprocess), runs the stage pipeline on it (``ingestion.pipeline``),
+and records progress in ``documents.status``.
 """
 
 import logging
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
-# LangChain Document for type hints
-from langchain_core.documents import Document as LangchainDocument
-
-from core.exceptions import (
-    DocumentBusyError,
-    DocumentNotFoundError,
-    MeditationDBError,
-    PipelineError,
-    ProcessingLeaseLostError,
-)
-from core.interfaces import PipelineContext, PipelineStage, StageStatus
+from core.exceptions import DocumentNotFoundError, PipelineError, ProcessingLeaseLostError
+from core.interfaces import PipelineContext, PipelineStage, StageName, StageStatus
 from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
 from ingestion.chunking import Config as ChunkingConfig
+from ingestion.claim import PreparedRun, ReprocessMode, claim_document
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.parsing import ParserFactory
+from ingestion.pipeline import PipelineOrchestrator
 from ingestion.stages import (
     ChunkingStage,
     DatabasePersistenceStage,
     EmbeddingStage,
     ParsingStage,
-    source_provenance,
 )
-from ingestion.status import RUNNING_STATUS, StatusRecorder
+from ingestion.status import StatusRecorder
+
+__all__ = ["IngestionOrchestrator", "IngestionResult", "ReprocessMode"]
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# REPROCESS MODES
-# ============================================================================
-
-
-class ReprocessMode(str, Enum):
-    """Supported reprocessing entry points for existing documents."""
-
-    FULL = "full"
-    FROM_CHUNKING = "from_chunking"
-    FROM_EMBEDDING = "from_embedding"
-
-
-# ============================================================================
-# DAG PIPELINE ORCHESTRATOR
-# ============================================================================
-
-
-class PipelineOrchestrator:
-    """
-    DAG-based pipeline orchestrator with automatic dependency resolution.
-
-    Stages are executed in topological order based on their dependencies.
-    Each stage is idempotent and can be resumed from any point.
-    """
-
-    def __init__(self, stages: List[PipelineStage]):
-        """
-        Initialize orchestrator with pipeline stages.
-
-        Args:
-            stages: List of pipeline stages to execute
-
-        Raises:
-            PipelineError: If stage dependencies form a cycle
-        """
-        self._stages = stages
-        self._stage_map = {stage.name: stage for stage in stages}
-        self._validate_dag()
-        self._execution_order = self._topological_sort()
-
-        logger.debug(f"Pipeline execution order: {[s.name for s in self._execution_order]}")
-
-    def _validate_dag(self):
-        """
-        Validate that stage dependencies form a valid DAG (no cycles).
-
-        Raises:
-            PipelineError: If circular dependency detected
-        """
-        visited = set()
-        rec_stack = set()
-
-        def has_cycle(stage_name: str) -> bool:
-            visited.add(stage_name)
-            rec_stack.add(stage_name)
-
-            stage = self._stage_map.get(stage_name)
-            if stage:
-                for dependency in stage.required_stages:
-                    if dependency not in visited:
-                        if has_cycle(dependency):
-                            return True
-                    elif dependency in rec_stack:
-                        return True
-
-            rec_stack.remove(stage_name)
-            return False
-
-        for stage_name in self._stage_map.keys():
-            if stage_name not in visited:
-                if has_cycle(stage_name):
-                    raise PipelineError("Circular dependency detected in pipeline stages")
-
-        logger.debug("DAG validation passed - no cycles detected")
-
-    def _topological_sort(self) -> List[PipelineStage]:
-        """
-        Sort stages in execution order using topological sort.
-
-        Returns:
-            List of stages in dependency order
-        """
-        # Calculate in-degrees: count how many dependencies each stage has
-        in_degree = {stage.name: len(stage.required_stages) for stage in self._stages}
-
-        # Find stages with no dependencies (in_degree = 0)
-        queue = [stage for stage in self._stages if in_degree[stage.name] == 0]
-        result = []
-
-        while queue:
-            # Take stage with no remaining dependencies
-            stage = queue.pop(0)
-            result.append(stage)
-
-            # Reduce in-degree for stages that depend on this one
-            for other_stage in self._stages:
-                if stage.name in other_stage.required_stages:
-                    in_degree[other_stage.name] -= 1
-                    if in_degree[other_stage.name] == 0:
-                        queue.append(other_stage)
-
-        if len(result) != len(self._stages):
-            raise PipelineError("Unable to determine stage execution order")
-
-        return result
-
-    async def execute(
-        self,
-        context: PipelineContext,
-        on_stage_update: Optional[Callable[[str, StageStatus], None]] = None,
-    ) -> PipelineContext:
-        """
-        Execute pipeline stages in dependency order.
-
-        Args:
-            context: Initial pipeline context
-            on_stage_update: Optional callback invoked with (stage_name, StageStatus)
-                for each stage transition (RUNNING, COMPLETED, FAILED).
-
-        Returns:
-            Final context after all stages
-        """
-        current_context = context
-
-        def _notify(stage_name: str, status: StageStatus):
-            if on_stage_update is not None:
-                on_stage_update(stage_name, status)
-
-        for stage in self._execution_order:
-            # Skip if already completed
-            if stage.should_skip(current_context):
-                logger.info(f"Skipping stage '{stage.name}' (already completed)")
-                continue
-
-            # Check if dependencies are met
-            if not stage.can_run(current_context):
-                missing = [
-                    dep
-                    for dep in stage.required_stages
-                    if current_context.stage_results.get(dep) != StageStatus.COMPLETED
-                ]
-                failed = [
-                    dep
-                    for dep in missing
-                    if current_context.stage_results.get(dep) == StageStatus.FAILED
-                ]
-                if failed:
-                    logger.info(f"Skipping stage '{stage.name}': {failed} failed")
-                else:
-                    logger.warning(
-                        f"Stage '{stage.name}' cannot run. Missing dependencies: {missing}"
-                    )
-                continue
-
-            # Execute stage. Stages raise when they cannot finish; this is the
-            # one place an exception becomes a FAILED stage with its message.
-            logger.info(f"Executing stage: {stage.name}")
-            _notify(stage.name, StageStatus.RUNNING)
-            try:
-                current_context = await stage.execute(current_context)
-            except ProcessingLeaseLostError:
-                # Another run owns the document now: stop, and record nothing.
-                raise
-            except MeditationDBError as e:
-                # Expected failures (ParsingError, EmbeddingError, ...) keep their message.
-                current_context = current_context.mark_stage_failed(stage.name, str(e))
-            except Exception as e:
-                logger.error("Unexpected error in stage '%s'", stage.name, exc_info=True)
-                current_context = current_context.mark_stage_failed(
-                    stage.name, f"Unexpected {type(e).__name__}: {e}"
-                )
-
-            if current_context.stage_results.get(stage.name) == StageStatus.FAILED:
-                error = current_context.error_messages.get(stage.name, "Unknown error")
-                logger.error(f"Stage '{stage.name}' failed: {error}")
-                _notify(stage.name, StageStatus.FAILED)
-                # Later stages that depend on this one are skipped below.
-            else:
-                _notify(stage.name, StageStatus.COMPLETED)
-
-        return current_context
-
-
-# ============================================================================
-# HIGH-LEVEL INGESTION ORCHESTRATOR
-# ============================================================================
 
 
 class IngestionResult(TypedDict):
@@ -242,26 +43,6 @@ class IngestionResult(TypedDict):
     success: bool
     # True when the document was already COMPLETED and nothing was run.
     already_completed: bool
-
-
-@dataclass
-class _PreparedRun:
-    """Everything the pipeline needs to start on one claimed document."""
-
-    document_id: int
-    source: Optional[str]
-    title: Optional[str]
-    token: str
-    # The document was COMPLETED when the run started: a reprocess replaces it.
-    replacing: bool = False
-    parsed_content: Optional[str] = None
-    chunks: List[LangchainDocument] = field(default_factory=list)
-    stage_results: Dict[str, StageStatus] = field(default_factory=dict)
-    source_metadata: Dict[str, Any] = field(default_factory=dict)
-    # The document's own vector collection; publishing writes there.
-    vector_collection: Optional[str] = None
-    # The status the claim set as the run started.
-    start_status: Optional[Any] = None
 
 
 class IngestionOrchestrator:
@@ -389,7 +170,17 @@ class IngestionOrchestrator:
                 return self._existing_result(admission.document_id)
             document_id = admission.document_id
 
-        run = self._claim(document_id, title, mode, clear_markdown)
+        run = claim_document(
+            document_id,
+            title=title,
+            mode=mode,
+            clear_markdown=clear_markdown,
+            lease_seconds=self.lease_seconds,
+            configured_collection=self.vector_store_config.collection_name,
+            vector_store_manager=(
+                self.vector_store_manager if self.enable_database_persistence else None
+            ),
+        )
         if run is None:
             return self._existing_result(document_id)
         return await self._run_pipeline(run, mode, on_stage_update)
@@ -415,7 +206,7 @@ class IngestionOrchestrator:
         return admit(source, title=title, description=description, tags=tags, doc_metadata=metadata)
 
     # ------------------------------------------------------------------
-    # Preparing a document
+    # Before the pipeline
     # ------------------------------------------------------------------
 
     def _check_same_database(self) -> None:
@@ -427,147 +218,6 @@ class IngestionOrchestrator:
         # Compares URLs only; no connection is opened.
         with session_scope() as session:
             self.vector_store_manager.validate_database(session)
-
-    def _claim(
-        self,
-        document_id: int,
-        title: Optional[str],
-        mode: Optional[ReprocessMode],
-        clear_markdown: bool,
-    ) -> Optional[_PreparedRun]:
-        """Take the document's processing claim and load what the run reuses.
-
-        Returns None, without claiming, when the document is COMPLETED and no
-        reprocess was asked for.
-
-        Raises:
-            DocumentNotFoundError: No such document.
-            DocumentBusyError: Another run holds a live claim on it.
-        """
-        from db.crud import ChunkCRUD, DocumentCRUD
-        from db.database import session_scope
-        from db.schema import DocumentStatus
-
-        token = uuid.uuid4().hex
-        stale_before = datetime.now(timezone.utc) - timedelta(seconds=self.lease_seconds)
-
-        with session_scope() as session:
-            crud = DocumentCRUD(session)
-            doc = crud.get_document_by_id(document_id)
-            if not doc:
-                raise DocumentNotFoundError(f"Document {document_id} not found")
-
-            was_completed = doc.status == DocumentStatus.COMPLETED
-            if was_completed and mode is None:
-                return None
-
-            run = _PreparedRun(
-                document_id=doc.id,
-                source=doc.file_path,
-                title=title,
-                token=token,
-                replacing=was_completed,
-            )
-            self._seed(run, doc, ChunkCRUD(session), mode)
-
-            # The claim also sets the status of the first stage that will run,
-            # saving that stage a status write of its own.
-            first_stage = next(name for name in RUNNING_STATUS if name not in run.stage_results)
-            run.start_status = RUNNING_STATUS[first_stage]
-            if not crud.claim_for_processing(
-                document_id,
-                token,
-                stale_before,
-                status=run.start_status,
-                status_details=f"Stage '{first_stage}' running",
-            ):
-                raise DocumentBusyError(
-                    f"Document {document_id} is being processed by another run; "
-                    f"try again once it finishes (a dead run's claim lapses after "
-                    f"{self.lease_seconds}s)"
-                )
-
-            if self.enable_database_persistence:
-                run.vector_collection = self._resolve_collection(session, doc)
-            if clear_markdown:
-                doc.markdown = None
-
-        logger.info("Document %s claimed for %s", document_id, mode.value if mode else "processing")
-        return run
-
-    def _resolve_collection(self, session: Any, doc: Any) -> str:
-        """The document's own vector collection, recorded on it if it lacked one.
-
-        Retries and reprocesses publish into the document's collection,
-        whatever collection this orchestrator is configured for. A document
-        ingested before collections were recorded inherits the collection its
-        vectors are already in, or else gets the configured one.
-        """
-        metadata = dict(doc.doc_metadata or {})
-        collection = metadata.get(VECTOR_COLLECTION_KEY)
-        if collection:
-            if collection != self.vector_store_config.collection_name:
-                logger.info(
-                    "Document %s stays in its own collection %r (not %r)",
-                    doc.id,
-                    collection,
-                    self.vector_store_config.collection_name,
-                )
-            return collection
-
-        collection = (
-            self.vector_store_manager.collection_of_document(session, doc.id)
-            or self.vector_store_config.collection_name
-        )
-        metadata[VECTOR_COLLECTION_KEY] = collection
-        doc.doc_metadata = metadata
-        return collection
-
-    @staticmethod
-    def _seed(
-        run: _PreparedRun,
-        doc: Any,
-        chunk_crud: Any,
-        mode: Optional[ReprocessMode],
-    ) -> None:
-        """Mark the stages a run can reuse as done, from what the document stores."""
-        reuses_stored = mode in (ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING)
-        resumes_from_markdown = mode is None and bool(doc.markdown)
-
-        if reuses_stored or resumes_from_markdown:
-            run.title = run.title or doc.title
-            run.source_metadata = source_provenance(doc.doc_metadata or {})
-        elif doc.title != "Untitled":
-            run.title = run.title or doc.title
-
-        if mode == ReprocessMode.FROM_CHUNKING or resumes_from_markdown:
-            if not doc.markdown:
-                raise PipelineError(
-                    f"Document {doc.id} has no stored markdown; cannot start from chunking"
-                )
-            run.parsed_content = doc.markdown
-            run.stage_results = {"parsing": StageStatus.COMPLETED}
-        elif mode == ReprocessMode.FROM_EMBEDDING:
-            existing_chunks = chunk_crud.get_chunks_by_document(doc.id)
-            if not existing_chunks:
-                raise PipelineError(
-                    f"Document {doc.id} has no stored chunks; cannot start from embedding"
-                )
-            run.stage_results = {
-                "parsing": StageStatus.COMPLETED,
-                "chunking": StageStatus.COMPLETED,
-            }
-            for chunk_row in existing_chunks:
-                metadata = dict(chunk_row.chunk_metadata or {})
-                metadata["uuid"] = chunk_row.uuid
-                run.chunks.append(
-                    LangchainDocument(page_content=chunk_row.chunk_text, metadata=metadata)
-                )
-
-        if mode == ReprocessMode.FULL and not run.source:
-            raise PipelineError(
-                f"Document {doc.id} is missing file_path; cannot reprocess from parsing"
-            )
 
     def _existing_result(self, document_id: int) -> IngestionResult:
         """Report a COMPLETED document without running anything."""
@@ -609,13 +259,15 @@ class IngestionOrchestrator:
         return stages
 
     @property
-    def _final_stage(self) -> str:
+    def _final_stage(self) -> StageName:
         """The stage whose completion means the document is done."""
-        return "database_persistence" if self.enable_database_persistence else "embedding"
+        if self.enable_database_persistence:
+            return StageName.DATABASE_PERSISTENCE
+        return StageName.EMBEDDING
 
     async def _run_pipeline(
         self,
-        run: _PreparedRun,
+        run: PreparedRun,
         mode: Optional[ReprocessMode],
         on_stage_update: Optional[Callable[[str, StageStatus], None]],
     ) -> IngestionResult:

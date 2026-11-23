@@ -21,17 +21,17 @@ import logging
 from typing import Dict, Optional
 
 from core.exceptions import ProcessingLeaseLostError
-from core.interfaces import StageStatus
+from core.interfaces import StageName, StageStatus
 from db.schema import DocumentStatus
 
 logger = logging.getLogger(__name__)
 
 RUNNING_STATUS: Dict[str, DocumentStatus] = {
-    "parsing": DocumentStatus.PARSING,
-    "chunking": DocumentStatus.CHUNKING,
-    "embedding": DocumentStatus.EMBEDDING,
+    StageName.PARSING: DocumentStatus.PARSING,
+    StageName.CHUNKING: DocumentStatus.CHUNKING,
+    StageName.EMBEDDING: DocumentStatus.EMBEDDING,
     # No dedicated persistence enum; keep this under the embedding phase.
-    "database_persistence": DocumentStatus.EMBEDDING,
+    StageName.DATABASE_PERSISTENCE: DocumentStatus.EMBEDDING,
 }
 
 

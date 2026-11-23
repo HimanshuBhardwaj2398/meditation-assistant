@@ -55,7 +55,7 @@ async def test_embedding_stage_lets_manager_errors_through():
 async def test_pipeline_keeps_domain_messages_and_names_unexpected_errors():
     """A MeditationDBError is recorded verbatim; anything else with its type."""
     from core.exceptions import EmbeddingError
-    from ingestion.orchestrator import PipelineOrchestrator
+    from ingestion.pipeline import PipelineOrchestrator
 
     class RaisingStage(PipelineStage):
         def __init__(self, stage_name, error):
