@@ -188,7 +188,7 @@ async def test_a_failed_reprocess_keeps_the_published_version(
     with ingest_db.session_scope() as session:
         details = session.get(Document, document_id).status_details
     assert "previous version is still published" in details
-    assert "publication interrupted" in details
+    assert details.endswith("database_persistence: publication interrupted")
 
 
 async def test_reprocess_from_embedding_keeps_chunk_ids(orchestrator, ingest_db, vectors):

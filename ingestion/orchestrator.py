@@ -346,7 +346,10 @@ class IngestionOrchestrator:
                 logger.info(f"Pipeline completed successfully for document {run.document_id}")
             else:
                 logger.warning(f"Pipeline partially completed for document {run.document_id}")
-                await asyncio.to_thread(recorder.finish_failed, str(final_context.error_messages))
+                details = "; ".join(
+                    f"{stage}: {message}" for stage, message in final_context.error_messages.items()
+                )
+                await asyncio.to_thread(recorder.finish_failed, details)
 
             return result
 

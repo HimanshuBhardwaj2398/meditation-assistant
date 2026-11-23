@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from core.exceptions import DatabaseError
 from db.crud import DocumentCRUD
 from db.database import Database, get_database
 from db.schema import DocumentStatus
@@ -95,7 +96,7 @@ def admit(
         else:
             doc = crud.get_document_by_file_path(source)
             if doc is None:
-                raise RuntimeError(f"{source!r} conflicted on insert but no document has it")
+                raise DatabaseError(f"{source!r} conflicted on insert but no document has it")
             outcome = (
                 AdmissionOutcome.COMPLETED
                 if doc.status == DocumentStatus.COMPLETED

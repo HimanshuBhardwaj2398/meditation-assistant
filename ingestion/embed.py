@@ -29,7 +29,6 @@ __all__ = [
     "EmbeddingError",
 ]
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 
@@ -104,7 +103,7 @@ class VectorStoreManager:
             key_kwargs = {"voyage_api_key": api_key} if api_key else {}
             try:
                 self._embeddings = VoyageAIEmbeddings(model=self.config.model_name, **key_kwargs)
-                logger.info(f"Initialized embeddings with model: {self.config.model_name}")
+                logger.info("Initialized embeddings with model %s", self.config.model_name)
             except Exception as e:
                 raise EmbeddingError(f"Failed to initialize embeddings: {e}") from e
 
@@ -143,20 +142,15 @@ class VectorStoreManager:
                 engine_args={"poolclass": NullPool},
             )
 
-            logger.info(f"Connected to vector store collection: {self.config.collection_name}")
-            return vector_store
-
         except pg_errors.InvalidCatalogName as e:
-            error_msg = (
-                f"Database '{self.config.collection_name}' not found. Check connection string."
-            )
-            logger.error(error_msg)
-            raise DatabaseConnectionError(error_msg) from e
-
+            raise DatabaseConnectionError(
+                f"The database named in the connection string does not exist: {e}"
+            ) from e
         except Exception as e:
-            error_msg = f"Failed to connect to database: {e}"
-            logger.error(error_msg)
-            raise DatabaseConnectionError(error_msg) from e
+            raise DatabaseConnectionError(f"Failed to connect to database: {e}") from e
+
+        logger.info("Connected to vector store collection %s", self.config.collection_name)
+        return vector_store
 
     def compute_embeddings(self, documents: List[Document]) -> List[List[float]]:
         """Compute vectors in input order without writing any database rows."""

@@ -49,41 +49,26 @@ class URLParser:
         Raises:
             ParsingError: If fetch or conversion fails
         """
+        logger.info("Parsing URL: %s", source)
         try:
-            logger.info(f"Parsing URL: {source}")
             response = requests.get(source, timeout=30)
             response.raise_for_status()
-
-            html_content = response.text
-            markdown_text = md(html_content, heading_style="ATX")
-
-            if not markdown_text or not markdown_text.strip():
-                raise ParsingError(f"URL parsing resulted in empty content: {source}")
-
-            # Extract title from first H1
-            title = self._extract_title(markdown_text)
-
-            logger.info(f"Successfully parsed URL: {source}")
-            return ParseResult(
-                content=markdown_text,
-                title=title,
-                metadata={
-                    "source_url": source,
-                    "content_type": response.headers.get("content-type"),
-                    "status_code": response.status_code,
-                },
-            )
-
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch URL {source}: {e}")
             raise ParsingError(f"Failed to fetch URL {source}: {e}") from e
-        except Exception as e:
-            logger.error(f"URL parsing failed for {source}: {e}")
-            raise ParsingError(f"URL parsing failed for {source}: {e}") from e
 
-    def _extract_title(self, markdown: str) -> Optional[str]:
-        """Extract title from first H1 header."""
-        return extract_first_h1(markdown, max_lines=20)
+        markdown_text = md(response.text, heading_style="ATX")
+        if not markdown_text.strip():
+            raise ParsingError(f"URL parsing resulted in empty content: {source}")
+
+        return ParseResult(
+            content=markdown_text,
+            title=extract_first_h1(markdown_text, max_lines=20),
+            metadata={
+                "source_url": source,
+                "content_type": response.headers.get("content-type"),
+                "status_code": response.status_code,
+            },
+        )
 
 
 class PDFParser:
@@ -127,12 +112,11 @@ class PDFParser:
         if not os.path.exists(source):
             raise ParsingError(f"PDF file not found: {source}")
 
+        logger.info("Parsing PDF: %s", source)
         try:
             # Lazy import: LlamaParse pulls a heavy (and currently fragile) dependency
             # chain, so it must not be imported unless a PDF is actually being parsed.
             from llama_cloud_services import LlamaParse
-
-            logger.info(f"Parsing PDF: {source}")
 
             parser = LlamaParse(
                 api_key=self.api_key,
@@ -145,27 +129,19 @@ class PDFParser:
 
             result = parser.parse(source)
             markdown_documents = result.get_markdown_documents(split_by_page=True)
-            full_markdown = "\n".join(doc.text for doc in markdown_documents)
-
-            if not full_markdown or not full_markdown.strip():
-                raise ParsingError(f"PDF parsing resulted in empty content: {source}")
-
-            title = self._extract_title(full_markdown)
-
-            logger.info(f"Successfully parsed PDF: {source} ({len(markdown_documents)} pages)")
-            return ParseResult(
-                content=full_markdown,
-                title=title,
-                metadata={"source_file": source, "page_count": len(markdown_documents)},
-            )
-
         except Exception as e:
-            logger.error(f"PDF parsing failed for {source}: {e}")
             raise ParsingError(f"PDF parsing failed for {source}: {e}") from e
 
-    def _extract_title(self, markdown: str) -> Optional[str]:
-        """Extract title from first H1 header."""
-        return extract_first_h1(markdown, max_lines=20)
+        full_markdown = "\n".join(doc.text for doc in markdown_documents)
+        if not full_markdown.strip():
+            raise ParsingError(f"PDF parsing resulted in empty content: {source}")
+
+        logger.info("Parsed PDF %s (%s pages)", source, len(markdown_documents))
+        return ParseResult(
+            content=full_markdown,
+            title=extract_first_h1(full_markdown, max_lines=20),
+            metadata={"source_file": source, "page_count": len(markdown_documents)},
+        )
 
 
 # ============================================================================
@@ -196,9 +172,8 @@ class ParserFactory:
         # Only add PDF parser if API key is available
         try:
             self._parsers.append(PDFParser(api_key=llamaparse_api_key))
-            logger.debug("PDF parser initialized successfully")
         except ConfigurationError as e:
-            logger.warning(f"PDF parser not available: {e}")
+            logger.warning("PDF parser not available: %s", e)
 
     def get_parser(self, source: str) -> Parser:
         """
@@ -215,12 +190,13 @@ class ParserFactory:
         """
         for parser in self._parsers:
             if parser.can_parse(source):
-                logger.debug(f"Selected {parser.__class__.__name__} for source: {source}")
+                logger.debug("Selected %s for source %s", type(parser).__name__, source)
                 return parser
 
         raise ParsingError(
             f"No parser available for source: {source}. "
-            f"Supported types: HTTP/HTTPS URLs, PDF files (.pdf)"
+            "Supported types: SuttaCentral references (sc:<uid>/<author>) and reading "
+            "URLs, HTTP/HTTPS URLs, PDF files (.pdf)"
         )
 
     def parse(self, source: str) -> ParseResult:
