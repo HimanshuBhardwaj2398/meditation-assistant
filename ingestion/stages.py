@@ -74,11 +74,6 @@ class _BlockingStage(PipelineStage):
         """Do the stage's work; raise if it cannot finish."""
 
 
-# ============================================================================
-# STAGE 1: PARSING
-# ============================================================================
-
-
 class ParsingStage(_BlockingStage):
     """
     Stage 1: Parse source document into markdown.
@@ -98,27 +93,20 @@ class ParsingStage(_BlockingStage):
 
     @property
     def required_stages(self) -> List[str]:
-        return []  # No dependencies
+        return []
 
     def run(self, context: PipelineContext) -> PipelineContext:
-        """
-        Parse source document and update context.
-
-        Args:
-            context: Pipeline context with source
-
-        Returns:
-            Context with parsed_content and title populated
+        """Parse the source, and store its markdown so a retry can resume from it.
 
         Raises:
-            ParsingError: If parsing fails
+            ParsingError: The source could not be parsed.
+            ProcessingLeaseLostError: Another run has taken the document over.
         """
         if not context.source:
             raise ParsingError("No source provided in context")
 
         logger.info("Parsing source: %s", context.source)
 
-        # Use ParserFactory to automatically select parser
         result = self.parser_factory.parse(context.source)
 
         logger.info("Successfully parsed: %s (title: %s)", context.source, result.title)
@@ -150,11 +138,6 @@ class ParsingStage(_BlockingStage):
         ).mark_stage_completed(self.name)
 
 
-# ============================================================================
-# STAGE 2: CHUNKING
-# ============================================================================
-
-
 class ChunkingStage(_BlockingStage):
     """
     Stage 2: Chunk parsed markdown into semantic segments.
@@ -182,17 +165,10 @@ class ChunkingStage(_BlockingStage):
         return [StageName.PARSING]
 
     def run(self, context: PipelineContext) -> PipelineContext:
-        """
-        Chunk parsed content into semantic segments.
-
-        Args:
-            context: Pipeline context with parsed content
-
-        Returns:
-            Context with chunks populated
+        """Split the markdown into chunks (see ``ingestion.chunking``).
 
         Raises:
-            ChunkingError: If chunking fails
+            ChunkingError: There is no markdown, or chunking failed.
         """
         if not context.parsed_content:
             raise ChunkingError("No parsed content available for chunking")
@@ -212,11 +188,6 @@ class ChunkingStage(_BlockingStage):
         )
 
         return context.with_update(chunks=chunks).mark_stage_completed(self.name)
-
-
-# ============================================================================
-# STAGE 3: EMBEDDING
-# ============================================================================
 
 
 class EmbeddingStage(_BlockingStage):
@@ -240,17 +211,12 @@ class EmbeddingStage(_BlockingStage):
         return [StageName.CHUNKING]
 
     def run(self, context: PipelineContext) -> PipelineContext:
-        """
-        Compute vectors and attach the chunk IDs used by both tables.
+        """Tag each chunk with its document's keys and an ID, then embed it.
 
-        Args:
-            context: Pipeline context with chunks
-
-        Returns:
-            Context marked as embedding completed
+        The ID becomes the chunk row's uuid and the vector's custom_id.
 
         Raises:
-            EmbeddingError: If embedding fails
+            EmbeddingError: There are no chunks, or the provider failed.
         """
         if not context.chunks:
             raise EmbeddingError("No chunks available for embedding")
@@ -284,11 +250,6 @@ class EmbeddingStage(_BlockingStage):
         return context.with_update(chunks=enriched_chunks, vectors=vectors).mark_stage_completed(
             self.name
         )
-
-
-# ============================================================================
-# STAGE 4: DATABASE PERSISTENCE
-# ============================================================================
 
 
 class DatabasePersistenceStage(_BlockingStage):

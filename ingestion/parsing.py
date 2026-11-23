@@ -22,11 +22,6 @@ from ingestion.suttacentral import SuttaCentralParser
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# CONCRETE PARSER IMPLEMENTATIONS
-# ============================================================================
-
-
 class URLParser:
     """Parser for web URLs using requests + markdownify."""
 
@@ -142,11 +137,6 @@ class PDFParser:
             title=extract_first_h1(full_markdown, max_lines=20),
             metadata={"source_file": source, "page_count": len(markdown_documents)},
         )
-
-
-# ============================================================================
-# PARSER FACTORY
-# ============================================================================
 
 
 class ParserFactory:
