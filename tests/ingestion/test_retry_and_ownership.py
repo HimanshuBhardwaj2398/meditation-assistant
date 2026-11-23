@@ -22,7 +22,7 @@ from core.interfaces import PipelineContext
 from db.crud import DocumentCRUD
 from db.schema import Chunk, Document, DocumentStatus
 from ingestion.admission import admit
-from ingestion.stages import DatabasePersistenceStage
+from ingestion.stages import DatabasePersistenceStage, ParsingStage
 from tests.ingestion.conftest import SOURCE
 from tests.ingestion.test_orchestrator_e2e import assert_published_in_step, snapshot
 
@@ -140,6 +140,24 @@ async def test_publishing_requires_the_runs_claim(ingest_db, vectors):
 
     assert snapshot(ingest_db, admission.document_id).uuids == []
     assert vectors.rows() == []
+
+
+async def test_storing_parsed_markdown_requires_the_runs_claim(ingest_db, parser):
+    admission = admit(SOURCE)
+    hold_claim(ingest_db, admission.document_id, "current-owner")
+    context = PipelineContext(
+        document_id=admission.document_id,
+        source=SOURCE,
+        processing_token="superseded-run",
+    )
+
+    with pytest.raises(ProcessingLeaseLostError):
+        await ParsingStage(parser).execute(context)
+
+    with ingest_db.session_scope() as session:
+        doc = session.get(Document, admission.document_id)
+        assert doc.markdown is None
+        assert doc.title == "Untitled"
 
 
 async def test_a_failed_reprocess_keeps_the_published_version(

@@ -92,16 +92,16 @@ async def test_parsing_title_is_consistent_in_context_and_database(
 ):
     from db import crud, database
 
-    doc = SimpleNamespace(title="Untitled", tags=[], doc_metadata={})
+    doc = SimpleNamespace(title="Untitled", tags=[], doc_metadata={}, processing_token="run")
     document_crud = MagicMock()
-    document_crud.get_document_by_id.return_value = doc
+    document_crud.get_document_for_update.return_value = doc
     monkeypatch.setattr(database, "session_scope", lambda: nullcontext(MagicMock()))
     monkeypatch.setattr(crud, "DocumentCRUD", lambda session: document_crud)
     factory = MagicMock()
     factory.parse.return_value = ParseResult(content="Content", title=extracted)
 
     result = await ParsingStage(factory).execute(
-        PipelineContext(document_id=7, source="source", title=supplied)
+        PipelineContext(document_id=7, source="source", title=supplied, processing_token="run")
     )
 
     assert result.stage_results["parsing"] == StageStatus.COMPLETED

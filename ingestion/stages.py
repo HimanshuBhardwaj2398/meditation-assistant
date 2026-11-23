@@ -8,7 +8,7 @@ orchestrator is the one place that turns an exception into a FAILED stage.
 
 import logging
 import uuid as uuid_lib
-from typing import List
+from typing import TYPE_CHECKING, List
 
 from langchain_core.documents import Document as LangchainDocument
 
@@ -25,6 +25,10 @@ from ingestion.chunking import Config as ChunkingConfig
 from ingestion.chunking import MarkdownChunker
 from ingestion.embed import VectorStoreManager
 from ingestion.parsing import ParserFactory
+
+if TYPE_CHECKING:
+    from db.crud import DocumentCRUD
+    from db.schema import Document
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +51,29 @@ CHUNK_TAG_KEYS = ("source", "uid", "author_uid", "lang", "nikaya", "nikaya_name"
 def source_provenance(metadata: dict) -> dict:
     """Source fields shared by freshly parsed and reprocessed documents."""
     return {key: metadata[key] for key in PROVENANCE_KEYS if key in metadata}
+
+
+def _load_owned_document(doc_crud: "DocumentCRUD", context: PipelineContext) -> "Document":
+    """Lock the run's document row and check the run still holds its claim.
+
+    Every stage that writes to the document goes through this, so a run that
+    another run took over cannot change it. The row lock keeps the check and
+    the writes after it in one step.
+
+    Raises:
+        DocumentNotFoundError: No such document.
+        ProcessingLeaseLostError: Another run has taken the document over.
+    """
+    assert context.document_id is not None
+    doc = doc_crud.get_document_for_update(context.document_id)
+    if doc is None:
+        raise DocumentNotFoundError(f"Document {context.document_id} not found")
+    if context.processing_token is None or doc.processing_token != context.processing_token:
+        raise ProcessingLeaseLostError(
+            f"Document {context.document_id}: this run no longer holds its processing "
+            "claim; another run took it over"
+        )
+    return doc
 
 
 # ============================================================================
@@ -111,19 +138,19 @@ class ParsingStage(PipelineStage):
         tags = metadata.get("tags")
         structured = source_provenance(metadata)
 
-        # Persist markdown, the parsed title, and source tags/metadata
+        # Store the markdown so a retry can resume from it, with the parsed
+        # title and source tags/metadata.
         if context.document_id:
             with session_scope() as session:
-                doc = DocumentCRUD(session).get_document_by_id(context.document_id)
-                if doc:
-                    doc.markdown = result.content
-                    doc.title = title
-                    if tags:
-                        existing = list(doc.tags or [])
-                        doc.tags = existing + [t for t in tags if t not in existing]
-                    if structured:
-                        doc.doc_metadata = {**(doc.doc_metadata or {}), **structured}
-            logger.info(f"Saved markdown/title/tags to database for document {context.document_id}")
+                doc = _load_owned_document(DocumentCRUD(session), context)
+                doc.markdown = result.content
+                doc.title = title
+                if tags:
+                    existing = list(doc.tags or [])
+                    doc.tags = existing + [t for t in tags if t not in existing]
+                if structured:
+                    doc.doc_metadata = {**(doc.doc_metadata or {}), **structured}
+            logger.info("Stored markdown for document %s", context.document_id)
 
         # Update context with parsed results (source_metadata tags the chunks later)
         return context.with_update(
@@ -410,14 +437,7 @@ class DatabasePersistenceStage(PipelineStage):
             doc_crud = DocumentCRUD(session)
             chunk_crud = ChunkCRUD(session)
 
-            doc = doc_crud.get_document_for_update(context.document_id)
-            if doc is None:
-                raise DocumentNotFoundError(f"Document {context.document_id} not found")
-            if context.processing_token is None or doc.processing_token != context.processing_token:
-                raise ProcessingLeaseLostError(
-                    f"Document {context.document_id}: this run no longer holds its processing "
-                    "claim; another run took it over"
-                )
+            doc = _load_owned_document(doc_crud, context)
 
             # Prepare chunk data for database
             chunks_data = []
