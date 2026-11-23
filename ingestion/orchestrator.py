@@ -16,7 +16,7 @@ from core.interfaces import PipelineContext, PipelineStage, StageName, StageStat
 from db.crud import ChunkCRUD, DocumentCRUD
 from db.database import Database, get_database
 from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
-from ingestion.chunking import Config as ChunkingConfig
+from ingestion.chunking import ChunkingConfig
 from ingestion.claim import PreparedRun, ReprocessMode, claim_document
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.parsing import ParserFactory

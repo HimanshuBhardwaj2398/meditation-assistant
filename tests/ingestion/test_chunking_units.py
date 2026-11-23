@@ -9,11 +9,11 @@ interpretations disagree.
 
 from langchain.schema import Document
 
-from ingestion.chunking import Config, MarkdownChunker
+from ingestion.chunking import ChunkingConfig, MarkdownChunker
 
 
 def make_chunker(**overrides) -> MarkdownChunker:
-    config = Config(enable_semantic=False, enable_parallel=False, **overrides)
+    config = ChunkingConfig(enable_semantic=False, enable_parallel=False, **overrides)
     return MarkdownChunker(text="# Title\n\nbody", config=config)
 
 

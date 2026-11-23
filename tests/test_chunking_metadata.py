@@ -2,7 +2,7 @@
 
 from langchain.schema import Document
 
-from ingestion.chunking import Config, MarkdownChunker
+from ingestion.chunking import ChunkingConfig, MarkdownChunker
 from ingestion.toc import build_table_of_contents
 
 
@@ -12,7 +12,7 @@ class TestBuildHeaderPath:
     def setup_method(self):
         self.chunker = MarkdownChunker(
             text="# Test\nSome content",
-            config=Config(enable_semantic=False),
+            config=ChunkingConfig(enable_semantic=False),
         )
 
     def test_single_header(self):
@@ -55,7 +55,7 @@ class TestAddFinalMetadata:
     def setup_method(self):
         self.chunker = MarkdownChunker(
             text="# Test Doc\nSome content",
-            config=Config(enable_semantic=False),
+            config=ChunkingConfig(enable_semantic=False),
             title="Test Doc",
         )
 
@@ -218,7 +218,7 @@ class TestSplitOversizedChunks:
     def test_preserves_order_when_first_chunk_is_oversized(self):
         chunker = MarkdownChunker(
             text="# Test\nx",
-            config=Config(
+            config=ChunkingConfig(
                 enable_semantic=False,
                 max_size=20,
                 min_size=1,

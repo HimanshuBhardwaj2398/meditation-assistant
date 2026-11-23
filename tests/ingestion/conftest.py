@@ -19,7 +19,7 @@ from core.interfaces import ParseResult
 from db import database as database_module
 from db.database import Database
 from db.schema import Base
-from ingestion.chunking import Config as ChunkingConfig
+from ingestion.chunking import ChunkingConfig
 from ingestion.embed import VectorStoreConfig
 from ingestion.orchestrator import IngestionOrchestrator
 from tests import sqlite_compat

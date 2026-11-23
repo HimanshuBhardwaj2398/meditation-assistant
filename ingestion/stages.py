@@ -26,8 +26,7 @@ from core.interfaces import PipelineContext, PipelineStage, StageName
 from db.crud import ChunkCRUD, DocumentCRUD
 from db.database import Database
 from db.schema import Document, DocumentStatus
-from ingestion.chunking import Config as ChunkingConfig
-from ingestion.chunking import MarkdownChunker
+from ingestion.chunking import ChunkingConfig, MarkdownChunker
 from ingestion.embed import VectorStoreManager
 from ingestion.parsing import ParserFactory
 from ingestion.toc import build_table_of_contents
