@@ -33,9 +33,12 @@ def _default_sources() -> list[str]:
     return [f"sc:mn{i}/sujato" for i in range(1, 6)]
 
 
-async def _ingest_all(sources: list[str], collection: str, neon_url: str) -> bool:
+async def _ingest_all(
+    sources: list[str], collection: str, neon_url: str, database: Database
+) -> bool:
     orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url)
+        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url),
+        database=database,
     )
     success = True
     for source in sources:
@@ -72,7 +75,7 @@ def main(argv: list[str]) -> None:
 
     collection = get_settings().vector.collection_name
     print(f"Batch-ingesting {len(sources)} source(s) into {collection!r} ...")
-    if not asyncio.run(_ingest_all(sources, collection, neon_url)):
+    if not asyncio.run(_ingest_all(sources, collection, neon_url, database)):
         raise SystemExit(1)
 
 

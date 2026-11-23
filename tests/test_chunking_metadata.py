@@ -3,8 +3,7 @@
 from langchain.schema import Document
 
 from ingestion.chunking import Config, MarkdownChunker
-from ingestion.embed import VectorStoreConfig, VectorStoreManager
-from ingestion.stages import DatabasePersistenceStage
+from ingestion.toc import build_table_of_contents
 
 
 class TestBuildHeaderPath:
@@ -134,11 +133,6 @@ class TestAddFinalMetadata:
 class TestBuildTableOfContents:
     """Tests for TOC builder with new metadata format."""
 
-    def setup_method(self):
-        self.stage = DatabasePersistenceStage(
-            VectorStoreManager(VectorStoreConfig(db_url="postgresql://test/test"))
-        )
-
     def test_single_path_chunks(self):
         chunks = [
             Document(
@@ -156,7 +150,7 @@ class TestBuildTableOfContents:
                 },
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
 
         assert len(toc["entries"]) == 3  # DN, Sutta 1, Sutta 2
         assert toc["entries"][0]["text"] == "DN"
@@ -175,12 +169,12 @@ class TestBuildTableOfContents:
                 },
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
 
         assert len(toc["entries"]) == 3  # DN, Sutta 1, Sutta 2
 
     def test_empty_chunks(self):
-        toc = self.stage._build_table_of_contents([])
+        toc = build_table_of_contents([])
         assert toc["entries"] == []
         assert toc["text"] == ""
 
@@ -191,7 +185,7 @@ class TestBuildTableOfContents:
                 metadata={"all_header_paths": [], "header_level_map": {}},
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
         assert toc["entries"] == []
 
     def test_same_segment_under_different_parents_kept(self):
@@ -211,7 +205,7 @@ class TestBuildTableOfContents:
                 },
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
         paths = [entry["path_from_root"] for entry in toc["entries"]]
 
         assert "DN 1 > Introduction" in paths

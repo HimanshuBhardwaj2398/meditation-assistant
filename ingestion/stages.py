@@ -10,7 +10,7 @@ import asyncio
 import logging
 import uuid as uuid_lib
 from abc import abstractmethod
-from typing import TYPE_CHECKING, List
+from typing import List
 
 from langchain_core.documents import Document as LangchainDocument
 
@@ -23,14 +23,14 @@ from core.exceptions import (
     ProcessingLeaseLostError,
 )
 from core.interfaces import PipelineContext, PipelineStage, StageName
+from db.crud import ChunkCRUD, DocumentCRUD
+from db.database import Database
+from db.schema import Document, DocumentStatus
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.chunking import MarkdownChunker
 from ingestion.embed import VectorStoreManager
 from ingestion.parsing import ParserFactory
-
-if TYPE_CHECKING:
-    from db.crud import DocumentCRUD
-    from db.schema import Document
+from ingestion.toc import build_table_of_contents
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ def source_provenance(metadata: dict) -> dict:
     return {key: metadata[key] for key in PROVENANCE_KEYS if key in metadata}
 
 
-def _load_owned_document(doc_crud: "DocumentCRUD", context: PipelineContext) -> "Document":
+def _load_owned_document(doc_crud: DocumentCRUD, context: PipelineContext) -> Document:
     """Lock the run's document row and check the run still holds its claim.
 
     Every stage that writes to the document goes through this, so a run that
@@ -107,14 +107,9 @@ class ParsingStage(_BlockingStage):
     Output: context.parsed_content, context.title
     """
 
-    def __init__(self, parser_factory: ParserFactory):
-        """
-        Initialize parsing stage.
-
-        Args:
-            parser_factory: Factory for creating appropriate parsers
-        """
+    def __init__(self, parser_factory: ParserFactory, database: Database):
         self.parser_factory = parser_factory
+        self.database = database
 
     @property
     def name(self) -> str:
@@ -137,9 +132,6 @@ class ParsingStage(_BlockingStage):
         Raises:
             ParsingError: If parsing fails
         """
-        from db.crud import DocumentCRUD
-        from db.database import session_scope
-
         if not context.source:
             raise ParsingError("No source provided in context")
 
@@ -158,7 +150,7 @@ class ParsingStage(_BlockingStage):
         # Store the markdown so a retry can resume from it, with the parsed
         # title and source tags/metadata.
         if context.document_id:
-            with session_scope() as session:
+            with self.database.session_scope() as session:
                 doc = _load_owned_document(DocumentCRUD(session), context)
                 doc.markdown = result.content
                 doc.title = title
@@ -340,8 +332,9 @@ class DatabasePersistenceStage(_BlockingStage):
     Output: Chunks saved to database, document status updated to COMPLETED
     """
 
-    def __init__(self, vector_store_manager: VectorStoreManager):
+    def __init__(self, vector_store_manager: VectorStoreManager, database: Database):
         self.vector_store_manager = vector_store_manager
+        self.database = database
 
     @property
     def name(self) -> str:
@@ -350,71 +343,6 @@ class DatabasePersistenceStage(_BlockingStage):
     @property
     def required_stages(self) -> List[str]:
         return [StageName.EMBEDDING]
-
-    def _build_table_of_contents(self, chunks: List) -> dict:
-        """
-        Build table of contents from chunk header paths.
-
-        Reads all_header_paths and header_level_map from chunk metadata
-        to construct a hierarchical TOC.
-
-        Args:
-            chunks: List of LangChain Documents with header path metadata
-
-        Returns:
-            Dict with 'entries' (structured list) and 'text' (indented string)
-        """
-        entries = []
-        seen_paths = {}  # path_from_root -> entry_id
-        entry_count = 0
-
-        for idx, chunk in enumerate(chunks):
-            metadata = chunk.metadata or {}
-            paths = metadata.get("all_header_paths", [])
-            level_map = metadata.get("header_level_map", {})
-
-            for path in paths:
-                segments = [s.strip() for s in path.split(" > ") if s.strip()]
-                if not segments:
-                    continue
-
-                parent_path = ""
-                for depth, segment in enumerate(segments, start=1):
-                    current_path = f"{parent_path} > {segment}" if parent_path else segment
-
-                    if current_path in seen_paths:
-                        parent_path = current_path
-                        continue
-
-                    level = level_map.get(segment, depth)
-                    entry_id = f"h{level}_{entry_count}"
-                    parent_id = seen_paths.get(parent_path)
-
-                    entries.append(
-                        {
-                            "id": entry_id,
-                            "level": level,
-                            "text": segment,
-                            "parent_id": parent_id,
-                            "chunk_index": idx,
-                            "path_from_root": current_path,
-                        }
-                    )
-
-                    seen_paths[current_path] = entry_id
-                    parent_path = current_path
-                    entry_count += 1
-
-        text_lines = []
-        for entry in entries:
-            indent = "  " * (entry["level"] - 1)
-            text_lines.append(f"{indent}{entry['text']}")
-
-        logger.debug(f"Built TOC with {len(entries)} entries")
-        return {
-            "entries": entries,
-            "text": "\n".join(text_lines),
-        }
 
     def run(self, context: PipelineContext) -> PipelineContext:
         """
@@ -438,10 +366,6 @@ class DatabasePersistenceStage(_BlockingStage):
             DatabaseError: If database operations fail
             ProcessingLeaseLostError: If this run no longer holds the claim
         """
-        from db.crud import ChunkCRUD, DocumentCRUD
-        from db.database import session_scope
-        from db.schema import DocumentStatus
-
         if not context.document_id:
             raise DatabaseError("No document_id in context")
 
@@ -450,7 +374,7 @@ class DatabasePersistenceStage(_BlockingStage):
 
         logger.info(f"Persisting {len(context.chunks)} chunks to database")
 
-        with session_scope() as session:
+        with self.database.session_scope() as session:
             doc_crud = DocumentCRUD(session)
             chunk_crud = ChunkCRUD(session)
 
@@ -499,7 +423,7 @@ class DatabasePersistenceStage(_BlockingStage):
             logger.info(f"Saved {len(created_chunks)} chunks to database")
 
             # Build the table of contents from chunk headers, replacing any old one
-            toc = self._build_table_of_contents(context.chunks)
+            toc = build_table_of_contents(context.chunks)
             doc_metadata = dict(doc.doc_metadata or {})
             if toc["entries"]:
                 doc_metadata["table_of_contents"] = toc

@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from db.crud import DocumentCRUD
+from db.database import Database, get_database
+from db.schema import DocumentStatus
 from ingestion.suttacentral import SuttaCentralParser, parse_sutta_ref
 
 logger = logging.getLogger(__name__)
@@ -70,18 +73,15 @@ def admit(
     description: Optional[str] = None,
     tags: Optional[List[str]] = None,
     doc_metadata: Optional[Dict[str, Any]] = None,
+    database: Optional[Database] = None,
 ) -> Admission:
     """Find or create the document for a source, in one transaction.
 
     The optional fields only apply to a newly created document; an existing
-    document keeps its own.
+    document keeps its own. ``database`` defaults to the default database.
     """
-    from db.crud import DocumentCRUD
-    from db.database import session_scope
-    from db.schema import DocumentStatus
-
     source = canonical_source(source)
-    with session_scope() as session:
+    with (database or get_database()).session_scope() as session:
         crud = DocumentCRUD(session)
         new_id = crud.insert_if_absent(
             file_path=source,

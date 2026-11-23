@@ -177,12 +177,13 @@ def vectors(ingest_db) -> SessionVectorStore:
 
 
 @pytest.fixture
-def orchestrator(parser, vectors) -> IngestionOrchestrator:
+def orchestrator(ingest_db, parser, vectors) -> IngestionOrchestrator:
     return IngestionOrchestrator(
         VectorStoreConfig(db_url="sqlite://"),
         chunking_config=TEST_CHUNKING,
         parser_factory=parser,
         vector_store_manager=vectors,
+        database=ingest_db,
     )
 
 

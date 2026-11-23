@@ -17,9 +17,13 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document as LangchainDocument
+from sqlalchemy.orm import Session
 
 from core.exceptions import DocumentBusyError, DocumentNotFoundError, PipelineError
 from core.interfaces import StageName, StageStatus
+from db.crud import ChunkCRUD, DocumentCRUD
+from db.database import Database
+from db.schema import Document, DocumentStatus
 from ingestion.admission import VECTOR_COLLECTION_KEY
 from ingestion.embed import VectorStoreManager
 from ingestion.stages import source_provenance
@@ -53,10 +57,11 @@ class PreparedRun:
     # The document's own vector collection; publishing writes there.
     vector_collection: Optional[str] = None
     # The status the claim set as the run started.
-    start_status: Optional[Any] = None
+    start_status: Optional[DocumentStatus] = None
 
 
 def claim_document(
+    database: Database,
     document_id: int,
     *,
     title: Optional[str],
@@ -69,6 +74,7 @@ def claim_document(
     """Take the document's processing claim and load what the run reuses.
 
     Args:
+        database: Where the document lives
         document_id: The document to claim
         title: Title given by the caller, if any
         mode: Reprocess entry point, or None to process or resume
@@ -85,14 +91,10 @@ def claim_document(
         DocumentNotFoundError: No such document.
         DocumentBusyError: Another run holds a live claim on it.
     """
-    from db.crud import ChunkCRUD, DocumentCRUD
-    from db.database import session_scope
-    from db.schema import DocumentStatus
-
     token = uuid.uuid4().hex
     stale_before = datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
 
-    with session_scope() as session:
+    with database.session_scope() as session:
         crud = DocumentCRUD(session)
         doc = crud.get_document_by_id(document_id)
         if not doc:
@@ -140,8 +142,8 @@ def claim_document(
 
 
 def _resolve_collection(
-    session: Any,
-    doc: Any,
+    session: Session,
+    doc: Document,
     configured_collection: str,
     vector_store_manager: VectorStoreManager,
 ) -> str:
@@ -174,8 +176,8 @@ def _resolve_collection(
 
 def _seed(
     run: PreparedRun,
-    doc: Any,
-    chunk_crud: Any,
+    doc: Document,
+    chunk_crud: ChunkCRUD,
     mode: Optional[ReprocessMode],
 ) -> None:
     """Mark the stages a run can reuse as done, from what the document stores."""

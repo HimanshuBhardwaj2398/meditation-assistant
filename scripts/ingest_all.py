@@ -105,7 +105,8 @@ def _build_orchestrator(neon_url: str):
 
     collection = get_settings().vector.collection_name
     orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url)
+        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url),
+        database=database,
     )
     return orchestrator
 

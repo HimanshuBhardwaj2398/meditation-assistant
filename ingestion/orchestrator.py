@@ -10,8 +10,11 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
+from config.settings import IngestionSettings
 from core.exceptions import DocumentNotFoundError, PipelineError, ProcessingLeaseLostError
 from core.interfaces import PipelineContext, PipelineStage, StageName, StageStatus
+from db.crud import ChunkCRUD, DocumentCRUD
+from db.database import Database, get_database
 from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
 from ingestion.chunking import Config as ChunkingConfig
 from ingestion.claim import PreparedRun, ReprocessMode, claim_document
@@ -65,6 +68,7 @@ class IngestionOrchestrator:
         *,
         parser_factory: Optional[ParserFactory] = None,
         vector_store_manager: Optional[VectorStoreManager] = None,
+        database: Optional[Database] = None,
     ):
         """
         Initialize ingestion orchestrator.
@@ -77,9 +81,10 @@ class IngestionOrchestrator:
                 ParserFactory (tests inject a fake)
             vector_store_manager: Vector adapter to use instead of one built
                 from vector_store_config (tests inject a fake)
+            database: The database documents and chunks are written to;
+                defaults to the default database (``set_default_database``)
         """
-        from config.settings import IngestionSettings
-
+        self.database = database or get_database()
         self.vector_store_config = vector_store_config
         self.chunking_config = chunking_config or ChunkingConfig.from_settings()
         self.enable_database_persistence = enable_database_persistence
@@ -175,6 +180,7 @@ class IngestionOrchestrator:
 
         run = await asyncio.to_thread(
             claim_document,
+            self.database,
             document_id,
             title=title,
             mode=mode,
@@ -207,7 +213,14 @@ class IngestionOrchestrator:
             **(doc_metadata or {}),
             VECTOR_COLLECTION_KEY: self.vector_store_config.collection_name,
         }
-        return admit(source, title=title, description=description, tags=tags, doc_metadata=metadata)
+        return admit(
+            source,
+            title=title,
+            description=description,
+            tags=tags,
+            doc_metadata=metadata,
+            database=self.database,
+        )
 
     # ------------------------------------------------------------------
     # Before the pipeline
@@ -217,18 +230,13 @@ class IngestionOrchestrator:
         """Vectors and documents must be written to the same database."""
         if not self.enable_database_persistence:
             return
-        from db.database import session_scope
-
         # Compares URLs only; no connection is opened.
-        with session_scope() as session:
+        with self.database.session_scope() as session:
             self.vector_store_manager.validate_database(session)
 
     def _existing_result(self, document_id: int) -> IngestionResult:
         """Report a COMPLETED document without running anything."""
-        from db.crud import ChunkCRUD, DocumentCRUD
-        from db.database import session_scope
-
-        with session_scope() as session:
+        with self.database.session_scope() as session:
             doc = DocumentCRUD(session).get_document_by_id(document_id)
             if not doc:
                 raise DocumentNotFoundError(f"Document {document_id} not found")
@@ -252,14 +260,14 @@ class IngestionOrchestrator:
 
     def _build_stages(self) -> List[PipelineStage]:
         stages: List[PipelineStage] = [
-            ParsingStage(self.parser_factory),
+            ParsingStage(self.parser_factory, self.database),
             ChunkingStage(self.chunking_config),
             EmbeddingStage(
                 self.vector_store_manager, vector_only=not self.enable_database_persistence
             ),
         ]
         if self.enable_database_persistence:
-            stages.append(DatabasePersistenceStage(self.vector_store_manager))
+            stages.append(DatabasePersistenceStage(self.vector_store_manager, self.database))
         return stages
 
     @property
@@ -277,7 +285,11 @@ class IngestionOrchestrator:
     ) -> IngestionResult:
         """Run the stages on a claimed document and report the outcome."""
         recorder = StatusRecorder(
-            run.document_id, run.token, replacing=run.replacing, current=run.start_status
+            self.database,
+            run.document_id,
+            run.token,
+            replacing=run.replacing,
+            current=run.start_status,
         )
 
         async def _on_stage_update(stage_name: str, stage_status: StageStatus) -> None:

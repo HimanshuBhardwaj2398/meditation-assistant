@@ -136,7 +136,7 @@ async def test_publishing_requires_the_runs_claim(ingest_db, vectors):
     )
 
     with pytest.raises(ProcessingLeaseLostError):
-        await DatabasePersistenceStage(vectors).execute(context)
+        await DatabasePersistenceStage(vectors, ingest_db).execute(context)
 
     assert snapshot(ingest_db, admission.document_id).uuids == []
     assert vectors.rows() == []
@@ -152,7 +152,7 @@ async def test_storing_parsed_markdown_requires_the_runs_claim(ingest_db, parser
     )
 
     with pytest.raises(ProcessingLeaseLostError):
-        await ParsingStage(parser).execute(context)
+        await ParsingStage(parser, ingest_db).execute(context)
 
     with ingest_db.session_scope() as session:
         doc = session.get(Document, admission.document_id)

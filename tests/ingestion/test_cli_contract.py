@@ -83,7 +83,9 @@ async def test_batch_sends_every_source_through_admission(
     processor = SimpleNamespace(process=AsyncMock(return_value=result))
     monkeypatch.setattr(cli, "IngestionOrchestrator", lambda **kwargs: processor)
 
-    success = await cli._ingest_all(["sc:mn1/sujato"], "test", "postgresql://test/test")
+    success = await cli._ingest_all(
+        ["sc:mn1/sujato"], "test", "postgresql://test/test", MagicMock()
+    )
 
     assert success is expected_success
     processor.process.assert_awaited_once_with("sc:mn1/sujato")
@@ -100,7 +102,7 @@ async def test_batch_reports_a_busy_source_and_carries_on(cli_modules, monkeypat
     monkeypatch.setattr(cli, "IngestionOrchestrator", lambda **kwargs: processor)
 
     success = await cli._ingest_all(
-        ["sc:mn1/sujato", "sc:mn2/sujato"], "test", "postgresql://test/test"
+        ["sc:mn1/sujato", "sc:mn2/sujato"], "test", "postgresql://test/test", MagicMock()
     )
 
     assert success is False

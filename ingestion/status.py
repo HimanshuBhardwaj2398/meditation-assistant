@@ -22,6 +22,8 @@ from typing import Dict, Optional
 
 from core.exceptions import ProcessingLeaseLostError
 from core.interfaces import StageName, StageStatus
+from db.crud import DocumentCRUD
+from db.database import Database
 from db.schema import DocumentStatus
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ class StatusRecorder:
 
     def __init__(
         self,
+        database: Database,
         document_id: int,
         token: str,
         *,
@@ -48,12 +51,14 @@ class StatusRecorder:
     ) -> None:
         """
         Args:
+            database: Where the document lives
             document_id: The document this run is processing
             token: The run's processing claim
             replacing: The document was COMPLETED when the run started, so a
                 failure leaves the previous version published
             current: The status the document has now (the one the claim set)
         """
+        self.database = database
         self.document_id = document_id
         self.token = token
         self.replacing = replacing
@@ -123,11 +128,7 @@ class StatusRecorder:
         return None
 
     def _write(self, status: DocumentStatus, details: str, release: bool = False) -> bool:
-        # Imported at call time so tests can swap the default database.
-        from db.crud import DocumentCRUD
-        from db.database import session_scope
-
-        with session_scope() as session:
+        with self.database.session_scope() as session:
             return DocumentCRUD(session).set_status_if_owner(
                 self.document_id,
                 self.token,

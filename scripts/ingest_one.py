@@ -45,7 +45,8 @@ def main(argv: list[str]) -> None:
     database.require_current_schema()  # schema is Alembic's job: alembic upgrade head
 
     orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url)
+        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url),
+        database=database,
     )
 
     print(f"Ingesting {source!r} into collection {collection!r} ...")

@@ -63,7 +63,7 @@ def test_the_ingestion_stages_order_without_persistence():
     stages = [
         EmbeddingStage(vector_store_manager=None, vector_only=True),  # type: ignore[arg-type]
         ChunkingStage(ChunkingConfig()),
-        ParsingStage(parser_factory=None),  # type: ignore[arg-type]
+        ParsingStage(parser_factory=None, database=None),  # type: ignore[arg-type]
     ]
     assert order(PipelineOrchestrator(stages)) == [
         StageName.PARSING,
