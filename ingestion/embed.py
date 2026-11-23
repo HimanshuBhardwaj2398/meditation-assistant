@@ -39,6 +39,12 @@ def _default_voyage_model() -> str:
     return EmbeddingSettings().voyage_model
 
 
+def _default_voyage_api_key() -> Optional[str]:
+    from config.settings import EmbeddingSettings
+
+    return EmbeddingSettings().voyage_api_key
+
+
 def _default_batch_size() -> int:
     from config.settings import EmbeddingSettings
 
@@ -64,6 +70,9 @@ class VectorStoreConfig:
     db_url: Optional[str] = None
     use_jsonb: bool = True
     batch_size: int = field(default_factory=_default_batch_size)
+    # Settings read .env without exporting it, so the key is passed to the
+    # client rather than left for it to find in os.environ.
+    voyage_api_key: Optional[str] = field(default_factory=_default_voyage_api_key, repr=False)
 
     def __post_init__(self):
         """Resolve the database URL from settings when not passed explicitly."""
@@ -96,11 +105,7 @@ class VectorStoreManager:
     def embeddings(self) -> Embeddings:
         """Lazy-load embeddings client."""
         if self._embeddings is None:
-            from config.settings import EmbeddingSettings
-
-            # Settings read .env without exporting it, so pass the key along
-            # rather than rely on VOYAGE_API_KEY being in os.environ.
-            api_key = EmbeddingSettings().voyage_api_key
+            api_key = self.config.voyage_api_key
             key_kwargs = {"voyage_api_key": api_key} if api_key else {}
             try:
                 self._embeddings = VoyageAIEmbeddings(model=self.config.model_name, **key_kwargs)
