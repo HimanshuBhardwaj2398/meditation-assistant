@@ -28,7 +28,7 @@ class FakeStage(PipelineStage):
 class TestPipelineCallback:
     def test_callback_called_for_each_stage(self):
         """Callback receives stage_name and status for each stage transition."""
-        from ingestion.orchestrator import PipelineOrchestrator
+        from ingestion.pipeline import PipelineOrchestrator
 
         callback = MagicMock()
         stages = [FakeStage("stage_a"), FakeStage("stage_b", deps=["stage_a"])]
@@ -46,7 +46,7 @@ class TestPipelineCallback:
 
     def test_callback_receives_failed_status(self):
         """Callback receives FAILED status when a stage fails."""
-        from ingestion.orchestrator import PipelineOrchestrator
+        from ingestion.pipeline import PipelineOrchestrator
 
         class FailingStage(PipelineStage):
             @property
@@ -70,7 +70,7 @@ class TestPipelineCallback:
 
     def test_no_callback_is_fine(self):
         """Pipeline works without callback (backward compatible)."""
-        from ingestion.orchestrator import PipelineOrchestrator
+        from ingestion.pipeline import PipelineOrchestrator
 
         stages = [FakeStage("stage_a")]
         pipeline = PipelineOrchestrator(stages)
