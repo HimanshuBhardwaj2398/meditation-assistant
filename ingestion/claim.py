@@ -28,7 +28,7 @@ from db.schema import Document, DocumentStatus
 from ingestion.admission import VECTOR_COLLECTION_KEY
 from ingestion.embed import VectorStoreManager
 from ingestion.markdown_utils import UNTITLED
-from ingestion.stages import source_provenance
+from ingestion.metadata import CHUNK_UUID_KEY, source_provenance
 from ingestion.status import RUNNING_STATUS
 
 logger = logging.getLogger(__name__)
@@ -233,7 +233,7 @@ def _seed(
         chunks: List[LangchainDocument] = [
             LangchainDocument(
                 page_content=row.chunk_text,
-                metadata={**(row.chunk_metadata or {}), "uuid": row.uuid},
+                metadata={**(row.chunk_metadata or {}), CHUNK_UUID_KEY: row.uuid},
             )
             for row in stored
         ]

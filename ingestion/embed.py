@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from core.exceptions import DatabaseConnectionError, EmbeddingError, VectorStoreError
+from ingestion.metadata import DOCUMENT_ID_KEY
 
 __all__ = [
     "VectorStoreConfig",
@@ -234,7 +235,7 @@ class VectorStoreManager:
         """
         self.validate_database(session)
         embedding = self.vector_store.EmbeddingStore
-        match = embedding.cmetadata["document_id"].astext == str(document_id)
+        match = embedding.cmetadata[DOCUMENT_ID_KEY].astext == str(document_id)
         if chunk_ids:
             match = or_(match, embedding.custom_id.in_(chunk_ids))
         return session.query(embedding).filter(match).delete(synchronize_session=False)
@@ -253,7 +254,7 @@ class VectorStoreManager:
             name
             for (name,) in session.query(collection.name)
             .join(embedding, embedding.collection_id == collection.uuid)
-            .filter(embedding.cmetadata["document_id"].astext == str(document_id))
+            .filter(embedding.cmetadata[DOCUMENT_ID_KEY].astext == str(document_id))
             .distinct()
         ]
         if len(names) > 1:

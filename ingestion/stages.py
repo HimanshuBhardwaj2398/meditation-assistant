@@ -29,30 +29,11 @@ from db.schema import Document, DocumentStatus
 from ingestion.chunking import ChunkingConfig, MarkdownChunker
 from ingestion.embed import VectorStoreManager
 from ingestion.markdown_utils import UNTITLED
+from ingestion.metadata import CHUNK_UUID_KEY, chunk_tags, source_provenance
 from ingestion.parsing import ParserFactory
 from ingestion.toc import build_table_of_contents
 
 logger = logging.getLogger(__name__)
-
-# Source fields stored on the document (doc_metadata).
-PROVENANCE_KEYS = (
-    "source",
-    "uid",
-    "author_uid",
-    "lang",
-    "nikaya",
-    "nikaya_name",
-    "nikaya_english",
-    "reading_url",
-)
-
-# The subset copied onto every chunk and vector, for retrieval filtering.
-CHUNK_TAG_KEYS = ("source", "uid", "author_uid", "lang", "nikaya", "nikaya_name")
-
-
-def source_provenance(metadata: dict) -> dict:
-    """Source fields shared by freshly parsed and reprocessed documents."""
-    return {key: metadata[key] for key in PROVENANCE_KEYS if key in metadata}
 
 
 def _load_owned_document(doc_crud: DocumentCRUD, context: PipelineContext) -> Document:
@@ -272,27 +253,20 @@ class EmbeddingStage(_BlockingStage):
         if not context.chunks:
             raise EmbeddingError("No chunks available for embedding")
 
-        logger.info(f"Embedding {len(context.chunks)} chunks")
+        logger.info("Embedding %s chunks", len(context.chunks))
 
         # Enrich copies, not the shared chunk objects — the input context
         # must stay unchanged (PipelineContext immutability is shallow).
+        tags = chunk_tags(context.document_id, context.title, context.source_metadata)
         enriched_chunks: List[LangchainDocument] = []
         for chunk in context.chunks:
-            metadata = dict(chunk.metadata)
-            if context.document_id is not None:
-                metadata.setdefault("document_id", context.document_id)
-                metadata.setdefault("original_doc_id", context.document_id)
-            if context.title:
-                metadata.setdefault("source_title", context.title)
-            # Tag each chunk with source/nikaya metadata for retrieval filtering
-            for key in CHUNK_TAG_KEYS:
-                if key in context.source_metadata:
-                    metadata.setdefault(key, context.source_metadata[key])
+            # Keys the chunk already has win (a reprocess keeps stored values).
+            metadata = {**tags, **chunk.metadata}
             # Keep a chunk's existing UUID (a from_embedding reprocess re-embeds
             # the stored chunks), so chunk IDs and eval labels keyed on them
             # survive a re-embed. New chunks get a fresh one.
-            chunk_uuid = metadata.get("uuid") or str(uuid_lib.uuid4())
-            metadata["uuid"] = chunk_uuid
+            chunk_uuid = metadata.get(CHUNK_UUID_KEY) or str(uuid_lib.uuid4())
+            metadata[CHUNK_UUID_KEY] = chunk_uuid
             enriched_chunks.append(
                 LangchainDocument(
                     # PGVector uses Document.id as the persisted vector ID.
@@ -364,7 +338,7 @@ class DatabasePersistenceStage(_BlockingStage):
         if not context.chunks:
             raise DatabaseError("No chunks to persist")
 
-        logger.info(f"Persisting {len(context.chunks)} chunks to database")
+        logger.info("Persisting %s chunks to database", len(context.chunks))
 
         with self.database.session_scope() as session:
             doc_crud = DocumentCRUD(session)
@@ -376,7 +350,7 @@ class DatabasePersistenceStage(_BlockingStage):
             chunks_data = []
             for idx, chunk in enumerate(context.chunks):
                 chunk_uuid = chunk.id
-                if not chunk_uuid or chunk.metadata.get("uuid") != chunk_uuid:
+                if not chunk_uuid or chunk.metadata.get(CHUNK_UUID_KEY) != chunk_uuid:
                     raise DatabaseError(f"Chunk {idx} has a missing or inconsistent UUID")
 
                 chunks_data.append(
@@ -384,7 +358,9 @@ class DatabasePersistenceStage(_BlockingStage):
                         "uuid": chunk_uuid,
                         "chunk_text": chunk.page_content,
                         "chunk_index": idx,
-                        "chunk_metadata": {k: v for k, v in chunk.metadata.items() if k != "uuid"},
+                        "chunk_metadata": {
+                            k: v for k, v in chunk.metadata.items() if k != CHUNK_UUID_KEY
+                        },
                     }
                 )
 
