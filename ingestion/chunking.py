@@ -260,8 +260,7 @@ class MarkdownChunker:
             return chunks, stats
 
         except Exception as e:
-            logger.error(f"Chunking failed: {e}")
-            raise ChunkingError(f"Pipeline failed: {e}")
+            raise ChunkingError(f"Chunking failed: {e}") from e
 
     async def _split_by_headers(self) -> List[Document]:
         """Split text by markdown headers."""
@@ -269,23 +268,17 @@ class MarkdownChunker:
             (f"{'#' * i}", f"Header {i}") for i in range(1, self.config.max_header_level + 1)
         ]
 
-        try:
-            splitter = MarkdownHeaderTextSplitter(
-                headers_to_split_on=headers_to_split, strip_headers=False
-            )
-            docs = splitter.split_text(self.text)
+        splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=headers_to_split, strip_headers=False
+        )
+        docs = splitter.split_text(self.text)
 
-            # Ensure all docs have metadata (don't filter here, let combine step handle tiny chunks)
-            for doc in docs:
-                if not doc.metadata:
-                    doc.metadata = self._extract_headers(doc.page_content)
+        # Ensure all docs have metadata (don't filter here, let combine step handle tiny chunks)
+        for doc in docs:
+            if not doc.metadata:
+                doc.metadata = self._extract_headers(doc.page_content)
 
-            return docs
-
-        except Exception as e:
-            logger.warning(f"Header splitting failed: {e}")
-            # Fallback to single document
-            return [Document(page_content=self.text, metadata=self._extract_headers(self.text))]
+        return docs
 
     async def _split_oversized_chunks(self, chunks: List[Document]) -> List[Document]:
         """Split chunks that exceed max_size using semantic splitting."""
@@ -336,7 +329,12 @@ class MarkdownChunker:
         return ordered_chunks
 
     def _semantic_split(self, chunk: Document) -> List[Document]:
-        """Split a single chunk using semantic chunking."""
+        """Split a single chunk using semantic chunking.
+
+        If the split fails, the oversized chunk is kept whole and marked
+        ``semantic_split_failed``, so degraded chunks can be found in the
+        stored chunk metadata instead of passing as normal ones.
+        """
         try:
             if not self.embeddings:
                 return [chunk]
@@ -352,8 +350,13 @@ class MarkdownChunker:
             return docs if len(docs) > 1 else [chunk]
 
         except Exception as e:
-            logger.warning(f"Semantic split failed: {e}")
-            return [chunk]
+            logger.warning(
+                "Semantic split failed; keeping a %s-character chunk whole: %s",
+                len(chunk.page_content),
+                e,
+            )
+            flagged = {**chunk.metadata, "semantic_split_failed": True}
+            return [Document(page_content=chunk.page_content, metadata=flagged)]
 
     def _combine_small_chunks(self, chunks: List[Document]) -> List[Document]:
         """

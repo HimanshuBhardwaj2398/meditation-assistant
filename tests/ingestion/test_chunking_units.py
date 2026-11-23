@@ -70,3 +70,44 @@ def test_combining_accumulates_characters_and_stops_at_min_size():
     assert len(merged) == 2
     # 100 + "\n\n" + 90
     assert len(merged[0].page_content) == 192
+
+
+async def test_a_header_splitter_error_fails_chunking(monkeypatch):
+    """A broken header split is a bug, not one big chunk passed off as success."""
+    import pytest
+
+    from core.exceptions import ChunkingError
+    from ingestion import chunking
+
+    class BrokenSplitter:
+        def __init__(self, **kwargs):
+            pass
+
+        def split_text(self, text):
+            raise RuntimeError("splitter exploded")
+
+    monkeypatch.setattr(chunking, "MarkdownHeaderTextSplitter", BrokenSplitter)
+
+    with pytest.raises(ChunkingError, match="splitter exploded"):
+        await make_chunker().chunk()
+
+
+def test_a_failed_semantic_split_keeps_the_chunk_and_flags_it():
+    """The oversized chunk survives, marked so degraded chunks can be found."""
+
+    class BrokenEmbeddings:
+        def embed_documents(self, texts):
+            raise RuntimeError("model unavailable")
+
+    chunker = make_chunker()
+    chunker.embeddings = BrokenEmbeddings()
+    chunk = Document(
+        page_content="One sentence here. Another sentence there. A third one.",
+        metadata={"Header 1": "Title"},
+    )
+
+    result = chunker._semantic_split(chunk)
+
+    assert [doc.page_content for doc in result] == [chunk.page_content]
+    assert result[0].metadata == {"Header 1": "Title", "semantic_split_failed": True}
+    assert chunk.metadata == {"Header 1": "Title"}
