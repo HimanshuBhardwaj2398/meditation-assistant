@@ -7,8 +7,7 @@ and managing the connection to PostgreSQL with pgvector extension.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from typing import List, Optional
 
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_core.documents import Document
@@ -21,6 +20,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from core.exceptions import DatabaseConnectionError, EmbeddingError, VectorStoreError
+from ingestion.metadata import DOCUMENT_ID_KEY
 
 __all__ = [
     "VectorStoreConfig",
@@ -30,7 +30,6 @@ __all__ = [
     "EmbeddingError",
 ]
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +37,12 @@ def _default_voyage_model() -> str:
     from config.settings import EmbeddingSettings
 
     return EmbeddingSettings().voyage_model
+
+
+def _default_voyage_api_key() -> Optional[str]:
+    from config.settings import EmbeddingSettings
+
+    return EmbeddingSettings().voyage_api_key
 
 
 def _default_batch_size() -> int:
@@ -65,6 +70,9 @@ class VectorStoreConfig:
     db_url: Optional[str] = None
     use_jsonb: bool = True
     batch_size: int = field(default_factory=_default_batch_size)
+    # Settings read .env without exporting it, so the key is passed to the
+    # client rather than left for it to find in os.environ.
+    voyage_api_key: Optional[str] = field(default_factory=_default_voyage_api_key, repr=False)
 
     def __post_init__(self):
         """Resolve the database URL from settings when not passed explicitly."""
@@ -97,15 +105,11 @@ class VectorStoreManager:
     def embeddings(self) -> Embeddings:
         """Lazy-load embeddings client."""
         if self._embeddings is None:
-            from config.settings import EmbeddingSettings
-
-            # Settings read .env without exporting it, so pass the key along
-            # rather than rely on VOYAGE_API_KEY being in os.environ.
-            api_key = EmbeddingSettings().voyage_api_key
+            api_key = self.config.voyage_api_key
             key_kwargs = {"voyage_api_key": api_key} if api_key else {}
             try:
                 self._embeddings = VoyageAIEmbeddings(model=self.config.model_name, **key_kwargs)
-                logger.info(f"Initialized embeddings with model: {self.config.model_name}")
+                logger.info("Initialized embeddings with model %s", self.config.model_name)
             except Exception as e:
                 raise EmbeddingError(f"Failed to initialize embeddings: {e}") from e
 
@@ -144,20 +148,15 @@ class VectorStoreManager:
                 engine_args={"poolclass": NullPool},
             )
 
-            logger.info(f"Connected to vector store collection: {self.config.collection_name}")
-            return vector_store
-
         except pg_errors.InvalidCatalogName as e:
-            error_msg = (
-                f"Database '{self.config.collection_name}' not found. Check connection string."
-            )
-            logger.error(error_msg)
-            raise DatabaseConnectionError(error_msg) from e
-
+            raise DatabaseConnectionError(
+                f"The database named in the connection string does not exist: {e}"
+            ) from e
         except Exception as e:
-            error_msg = f"Failed to connect to database: {e}"
-            logger.error(error_msg)
-            raise DatabaseConnectionError(error_msg) from e
+            raise DatabaseConnectionError(f"Failed to connect to database: {e}") from e
+
+        logger.info("Connected to vector store collection %s", self.config.collection_name)
+        return vector_store
 
     def compute_embeddings(self, documents: List[Document]) -> List[List[float]]:
         """Compute vectors in input order without writing any database rows."""
@@ -241,7 +240,7 @@ class VectorStoreManager:
         """
         self.validate_database(session)
         embedding = self.vector_store.EmbeddingStore
-        match = embedding.cmetadata["document_id"].astext == str(document_id)
+        match = embedding.cmetadata[DOCUMENT_ID_KEY].astext == str(document_id)
         if chunk_ids:
             match = or_(match, embedding.custom_id.in_(chunk_ids))
         return session.query(embedding).filter(match).delete(synchronize_session=False)
@@ -260,7 +259,7 @@ class VectorStoreManager:
             name
             for (name,) in session.query(collection.name)
             .join(embedding, embedding.collection_id == collection.uuid)
-            .filter(embedding.cmetadata["document_id"].astext == str(document_id))
+            .filter(embedding.cmetadata[DOCUMENT_ID_KEY].astext == str(document_id))
             .distinct()
         ]
         if len(names) > 1:
@@ -271,33 +270,3 @@ class VectorStoreManager:
             )
             return None
         return names[0] if names else None
-
-    def embed_documents(self, documents: List[Document]) -> List[str]:
-        """Compute and write vectors for callers without relational chunk persistence."""
-        if not documents:
-            return []
-        vectors = self.compute_embeddings(documents)
-        ids = [doc.id or str(uuid4()) for doc in documents]
-        try:
-            return self.vector_store.add_embeddings(
-                texts=[doc.page_content for doc in documents],
-                embeddings=vectors,
-                metadatas=[doc.metadata for doc in documents],
-                ids=ids,
-            )
-        except Exception as exc:
-            raise EmbeddingError(f"Failed to store embeddings: {exc}") from exc
-
-    def get_collection_info(self) -> Dict[str, Any]:
-        """
-        Get information about the current collection.
-
-        Returns:
-            Dictionary containing collection metadata.
-        """
-        return {
-            "collection_name": self.config.collection_name,
-            "model_name": self.config.model_name,
-            "batch_size": self.config.batch_size,
-            "use_jsonb": self.config.use_jsonb,
-        }

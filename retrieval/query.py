@@ -170,7 +170,7 @@ class RetrievalEngine:
                 collection_name=self._collection_name,
                 use_jsonb=True,
             )
-            logger.info(f"Connected to vector store: {self._collection_name}")
+            logger.info("Connected to vector store: %s", self._collection_name)
         return self._vector_store
 
     def _fts_search(self, query: str, k: int = 5) -> List[Document]:
@@ -499,4 +499,4 @@ class RetrievalEngine:
                         result.document_id = row[2]
                         result.source_title = row[3]
         except Exception as e:
-            logger.warning(f"Could not enrich results with document info: {e}")
+            logger.warning("Could not enrich results with document info: %s", e)

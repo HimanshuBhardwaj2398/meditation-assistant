@@ -6,8 +6,10 @@ return an updated context. A stage that cannot finish raises; the pipeline
 orchestrator is the one place that turns an exception into a FAILED stage.
 """
 
+import asyncio
 import logging
 import uuid as uuid_lib
+from abc import abstractmethod
 from typing import List
 
 from langchain_core.documents import Document as LangchainDocument
@@ -21,40 +23,58 @@ from core.exceptions import (
     ProcessingLeaseLostError,
 )
 from core.interfaces import PipelineContext, PipelineStage, StageName
-from ingestion.chunking import Config as ChunkingConfig
-from ingestion.chunking import MarkdownChunker
+from db.crud import ChunkCRUD, DocumentCRUD
+from db.database import Database
+from db.schema import Document, DocumentStatus
+from ingestion.chunking import ChunkingConfig, MarkdownChunker
 from ingestion.embed import VectorStoreManager
+from ingestion.markdown_utils import UNTITLED
+from ingestion.metadata import CHUNK_UUID_KEY, chunk_tags, source_provenance
 from ingestion.parsing import ParserFactory
+from ingestion.toc import build_table_of_contents
 
 logger = logging.getLogger(__name__)
 
-# Source fields stored on the document (doc_metadata).
-PROVENANCE_KEYS = (
-    "source",
-    "uid",
-    "author_uid",
-    "lang",
-    "nikaya",
-    "nikaya_name",
-    "nikaya_english",
-    "reading_url",
-)
 
-# The subset copied onto every chunk and vector, for retrieval filtering.
-CHUNK_TAG_KEYS = ("source", "uid", "author_uid", "lang", "nikaya", "nikaya_name")
+def _load_owned_document(doc_crud: DocumentCRUD, context: PipelineContext) -> Document:
+    """Lock the run's document row and check the run still holds its claim.
 
+    Every stage that writes to the document goes through this, so a run that
+    another run took over cannot change it. The row lock keeps the check and
+    the writes after it in one step.
 
-def source_provenance(metadata: dict) -> dict:
-    """Source fields shared by freshly parsed and reprocessed documents."""
-    return {key: metadata[key] for key in PROVENANCE_KEYS if key in metadata}
-
-
-# ============================================================================
-# STAGE 1: PARSING
-# ============================================================================
+    Raises:
+        DocumentNotFoundError: No such document.
+        ProcessingLeaseLostError: Another run has taken the document over.
+    """
+    assert context.document_id is not None
+    doc = doc_crud.get_document_for_update(context.document_id)
+    if doc is None:
+        raise DocumentNotFoundError(f"Document {context.document_id} not found")
+    if context.processing_token is None or doc.processing_token != context.processing_token:
+        raise ProcessingLeaseLostError(
+            f"Document {context.document_id}: this run no longer holds its processing "
+            "claim; another run took it over"
+        )
+    return doc
 
 
-class ParsingStage(PipelineStage):
+class _BlockingStage(PipelineStage):
+    """A stage whose work blocks: network calls, models, database round trips.
+
+    ``execute`` runs ``run`` in a worker thread, so the event loop stays free
+    and documents a caller runs concurrently do not wait on each other.
+    """
+
+    async def execute(self, context: PipelineContext) -> PipelineContext:
+        return await asyncio.to_thread(self.run, context)
+
+    @abstractmethod
+    def run(self, context: PipelineContext) -> PipelineContext:
+        """Do the stage's work; raise if it cannot finish."""
+
+
+class ParsingStage(_BlockingStage):
     """
     Stage 1: Parse source document into markdown.
 
@@ -63,14 +83,9 @@ class ParsingStage(PipelineStage):
     Output: context.parsed_content, context.title
     """
 
-    def __init__(self, parser_factory: ParserFactory):
-        """
-        Initialize parsing stage.
-
-        Args:
-            parser_factory: Factory for creating appropriate parsers
-        """
+    def __init__(self, parser_factory: ParserFactory, database: Database):
         self.parser_factory = parser_factory
+        self.database = database
 
     @property
     def name(self) -> str:
@@ -78,52 +93,42 @@ class ParsingStage(PipelineStage):
 
     @property
     def required_stages(self) -> List[str]:
-        return []  # No dependencies
+        return []
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
-        """
-        Parse source document and update context.
-
-        Args:
-            context: Pipeline context with source
-
-        Returns:
-            Context with parsed_content and title populated
+    def run(self, context: PipelineContext) -> PipelineContext:
+        """Parse the source, and store its markdown so a retry can resume from it.
 
         Raises:
-            ParsingError: If parsing fails
+            ParsingError: The source could not be parsed.
+            ProcessingLeaseLostError: Another run has taken the document over.
         """
-        from db.crud import DocumentCRUD
-        from db.database import session_scope
-
         if not context.source:
             raise ParsingError("No source provided in context")
 
-        logger.info(f"Parsing source: {context.source}")
+        logger.info("Parsing source: %s", context.source)
 
-        # Use ParserFactory to automatically select parser
         result = self.parser_factory.parse(context.source)
 
-        logger.info(f"Successfully parsed: {context.source} (title: {result.title})")
+        logger.info("Successfully parsed: %s (title: %s)", context.source, result.title)
 
         metadata = result.metadata or {}
-        title = context.title or result.title or "Untitled"
+        title = context.title or result.title or UNTITLED
         tags = metadata.get("tags")
         structured = source_provenance(metadata)
 
-        # Persist markdown, the parsed title, and source tags/metadata
+        # Store the markdown so a retry can resume from it, with the parsed
+        # title and source tags/metadata.
         if context.document_id:
-            with session_scope() as session:
-                doc = DocumentCRUD(session).get_document_by_id(context.document_id)
-                if doc:
-                    doc.markdown = result.content
-                    doc.title = title
-                    if tags:
-                        existing = list(doc.tags or [])
-                        doc.tags = existing + [t for t in tags if t not in existing]
-                    if structured:
-                        doc.doc_metadata = {**(doc.doc_metadata or {}), **structured}
-            logger.info(f"Saved markdown/title/tags to database for document {context.document_id}")
+            with self.database.session_scope() as session:
+                doc = _load_owned_document(DocumentCRUD(session), context)
+                doc.markdown = result.content
+                doc.title = title
+                if tags:
+                    existing = list(doc.tags or [])
+                    doc.tags = existing + [t for t in tags if t not in existing]
+                if structured:
+                    doc.doc_metadata = {**(doc.doc_metadata or {}), **structured}
+            logger.info("Stored markdown for document %s", context.document_id)
 
         # Update context with parsed results (source_metadata tags the chunks later)
         return context.with_update(
@@ -133,12 +138,7 @@ class ParsingStage(PipelineStage):
         ).mark_stage_completed(self.name)
 
 
-# ============================================================================
-# STAGE 2: CHUNKING
-# ============================================================================
-
-
-class ChunkingStage(PipelineStage):
+class ChunkingStage(_BlockingStage):
     """
     Stage 2: Chunk parsed markdown into semantic segments.
 
@@ -164,43 +164,33 @@ class ChunkingStage(PipelineStage):
     def required_stages(self) -> List[str]:
         return [StageName.PARSING]
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
-        """
-        Chunk parsed content into semantic segments.
-
-        Args:
-            context: Pipeline context with parsed content
-
-        Returns:
-            Context with chunks populated
+    def run(self, context: PipelineContext) -> PipelineContext:
+        """Split the markdown into chunks (see ``ingestion.chunking``).
 
         Raises:
-            ChunkingError: If chunking fails
+            ChunkingError: There is no markdown, or chunking failed.
         """
         if not context.parsed_content:
             raise ChunkingError("No parsed content available for chunking")
 
-        logger.info(f"Chunking document: {context.title}")
+        logger.info("Chunking document: %s", context.title)
 
         chunker = MarkdownChunker(
             text=context.parsed_content, config=self.chunking_config, title=context.title
         )
-        chunks, stats = await chunker.chunk()
+        chunks, stats = chunker.chunk()
 
         logger.info(
-            f"Chunking complete: {stats.total_chunks} chunks in "
-            f"{stats.processing_time:.2f}s (avg {stats.avg_chunk_size:.0f} words)"
+            "Chunking complete: %s chunks in %.2fs (avg %.0f words)",
+            stats.total_chunks,
+            stats.processing_time,
+            stats.avg_chunk_size,
         )
 
         return context.with_update(chunks=chunks).mark_stage_completed(self.name)
 
 
-# ============================================================================
-# STAGE 3: EMBEDDING
-# ============================================================================
-
-
-class EmbeddingStage(PipelineStage):
+class EmbeddingStage(_BlockingStage):
     """
     Stage 3: Compute vectors for chunks.
 
@@ -209,9 +199,8 @@ class EmbeddingStage(PipelineStage):
     Output: Chunks with UUIDs and vectors ready for persistence
     """
 
-    def __init__(self, vector_store_manager: VectorStoreManager, *, vector_only: bool = False):
+    def __init__(self, vector_store_manager: VectorStoreManager):
         self.vector_store_manager = vector_store_manager
-        self.vector_only = vector_only
 
     @property
     def name(self) -> str:
@@ -221,43 +210,31 @@ class EmbeddingStage(PipelineStage):
     def required_stages(self) -> List[str]:
         return [StageName.CHUNKING]
 
-    async def execute(self, context: PipelineContext) -> PipelineContext:
-        """
-        Compute vectors and attach the chunk IDs used by both tables.
+    def run(self, context: PipelineContext) -> PipelineContext:
+        """Tag each chunk with its document's keys and an ID, then embed it.
 
-        Args:
-            context: Pipeline context with chunks
-
-        Returns:
-            Context marked as embedding completed
+        The ID becomes the chunk row's uuid and the vector's custom_id.
 
         Raises:
-            EmbeddingError: If embedding fails
+            EmbeddingError: There are no chunks, or the provider failed.
         """
         if not context.chunks:
             raise EmbeddingError("No chunks available for embedding")
 
-        logger.info(f"Embedding {len(context.chunks)} chunks")
+        logger.info("Embedding %s chunks", len(context.chunks))
 
         # Enrich copies, not the shared chunk objects — the input context
         # must stay unchanged (PipelineContext immutability is shallow).
+        tags = chunk_tags(context.document_id, context.title, context.source_metadata)
         enriched_chunks: List[LangchainDocument] = []
         for chunk in context.chunks:
-            metadata = dict(chunk.metadata)
-            if context.document_id is not None:
-                metadata.setdefault("document_id", context.document_id)
-                metadata.setdefault("original_doc_id", context.document_id)
-            if context.title:
-                metadata.setdefault("source_title", context.title)
-            # Tag each chunk with source/nikaya metadata for retrieval filtering
-            for key in CHUNK_TAG_KEYS:
-                if key in context.source_metadata:
-                    metadata.setdefault(key, context.source_metadata[key])
+            # Keys the chunk already has win (a reprocess keeps stored values).
+            metadata = {**tags, **chunk.metadata}
             # Keep a chunk's existing UUID (a from_embedding reprocess re-embeds
             # the stored chunks), so chunk IDs and eval labels keyed on them
             # survive a re-embed. New chunks get a fresh one.
-            chunk_uuid = metadata.get("uuid") or str(uuid_lib.uuid4())
-            metadata["uuid"] = chunk_uuid
+            chunk_uuid = metadata.get(CHUNK_UUID_KEY) or str(uuid_lib.uuid4())
+            metadata[CHUNK_UUID_KEY] = chunk_uuid
             enriched_chunks.append(
                 LangchainDocument(
                     # PGVector uses Document.id as the persisted vector ID.
@@ -267,14 +244,7 @@ class EmbeddingStage(PipelineStage):
                 )
             )
 
-        if self.vector_only:
-            vector_ids = self.vector_store_manager.embed_documents(enriched_chunks)
-            expected_ids = {chunk.id for chunk in enriched_chunks}
-            if len(vector_ids) != len(enriched_chunks) or set(vector_ids) != expected_ids:
-                raise EmbeddingError("Stored vector IDs do not match the chunk IDs")
-            vectors = []
-        else:
-            vectors = self.vector_store_manager.compute_embeddings(enriched_chunks)
+        vectors = self.vector_store_manager.compute_embeddings(enriched_chunks)
 
         logger.info("Successfully embedded %s chunks", len(enriched_chunks))
         return context.with_update(chunks=enriched_chunks, vectors=vectors).mark_stage_completed(
@@ -282,12 +252,7 @@ class EmbeddingStage(PipelineStage):
         )
 
 
-# ============================================================================
-# STAGE 4: DATABASE PERSISTENCE
-# ============================================================================
-
-
-class DatabasePersistenceStage(PipelineStage):
+class DatabasePersistenceStage(_BlockingStage):
     """
     Stage 4: Publish vectors and relational metadata together.
 
@@ -296,8 +261,9 @@ class DatabasePersistenceStage(PipelineStage):
     Output: Chunks saved to database, document status updated to COMPLETED
     """
 
-    def __init__(self, vector_store_manager: VectorStoreManager):
+    def __init__(self, vector_store_manager: VectorStoreManager, database: Database):
         self.vector_store_manager = vector_store_manager
+        self.database = database
 
     @property
     def name(self) -> str:
@@ -307,72 +273,7 @@ class DatabasePersistenceStage(PipelineStage):
     def required_stages(self) -> List[str]:
         return [StageName.EMBEDDING]
 
-    def _build_table_of_contents(self, chunks: List) -> dict:
-        """
-        Build table of contents from chunk header paths.
-
-        Reads all_header_paths and header_level_map from chunk metadata
-        to construct a hierarchical TOC.
-
-        Args:
-            chunks: List of LangChain Documents with header path metadata
-
-        Returns:
-            Dict with 'entries' (structured list) and 'text' (indented string)
-        """
-        entries = []
-        seen_paths = {}  # path_from_root -> entry_id
-        entry_count = 0
-
-        for idx, chunk in enumerate(chunks):
-            metadata = chunk.metadata or {}
-            paths = metadata.get("all_header_paths", [])
-            level_map = metadata.get("header_level_map", {})
-
-            for path in paths:
-                segments = [s.strip() for s in path.split(" > ") if s.strip()]
-                if not segments:
-                    continue
-
-                parent_path = ""
-                for depth, segment in enumerate(segments, start=1):
-                    current_path = f"{parent_path} > {segment}" if parent_path else segment
-
-                    if current_path in seen_paths:
-                        parent_path = current_path
-                        continue
-
-                    level = level_map.get(segment, depth)
-                    entry_id = f"h{level}_{entry_count}"
-                    parent_id = seen_paths.get(parent_path)
-
-                    entries.append(
-                        {
-                            "id": entry_id,
-                            "level": level,
-                            "text": segment,
-                            "parent_id": parent_id,
-                            "chunk_index": idx,
-                            "path_from_root": current_path,
-                        }
-                    )
-
-                    seen_paths[current_path] = entry_id
-                    parent_path = current_path
-                    entry_count += 1
-
-        text_lines = []
-        for entry in entries:
-            indent = "  " * (entry["level"] - 1)
-            text_lines.append(f"{indent}{entry['text']}")
-
-        logger.debug(f"Built TOC with {len(entries)} entries")
-        return {
-            "entries": entries,
-            "text": "\n".join(text_lines),
-        }
-
-    async def execute(self, context: PipelineContext) -> PipelineContext:
+    def run(self, context: PipelineContext) -> PipelineContext:
         """
         Publish the document: its vectors, chunk rows, table of contents and
         COMPLETED status, in one transaction.
@@ -394,36 +295,25 @@ class DatabasePersistenceStage(PipelineStage):
             DatabaseError: If database operations fail
             ProcessingLeaseLostError: If this run no longer holds the claim
         """
-        from db.crud import ChunkCRUD, DocumentCRUD
-        from db.database import session_scope
-        from db.schema import DocumentStatus
-
         if not context.document_id:
             raise DatabaseError("No document_id in context")
 
         if not context.chunks:
             raise DatabaseError("No chunks to persist")
 
-        logger.info(f"Persisting {len(context.chunks)} chunks to database")
+        logger.info("Persisting %s chunks to database", len(context.chunks))
 
-        with session_scope() as session:
+        with self.database.session_scope() as session:
             doc_crud = DocumentCRUD(session)
             chunk_crud = ChunkCRUD(session)
 
-            doc = doc_crud.get_document_for_update(context.document_id)
-            if doc is None:
-                raise DocumentNotFoundError(f"Document {context.document_id} not found")
-            if context.processing_token is None or doc.processing_token != context.processing_token:
-                raise ProcessingLeaseLostError(
-                    f"Document {context.document_id}: this run no longer holds its processing "
-                    "claim; another run took it over"
-                )
+            doc = _load_owned_document(doc_crud, context)
 
             # Prepare chunk data for database
             chunks_data = []
             for idx, chunk in enumerate(context.chunks):
                 chunk_uuid = chunk.id
-                if not chunk_uuid or chunk.metadata.get("uuid") != chunk_uuid:
+                if not chunk_uuid or chunk.metadata.get(CHUNK_UUID_KEY) != chunk_uuid:
                     raise DatabaseError(f"Chunk {idx} has a missing or inconsistent UUID")
 
                 chunks_data.append(
@@ -431,7 +321,9 @@ class DatabasePersistenceStage(PipelineStage):
                         "uuid": chunk_uuid,
                         "chunk_text": chunk.page_content,
                         "chunk_index": idx,
-                        "chunk_metadata": {k: v for k, v in chunk.metadata.items() if k != "uuid"},
+                        "chunk_metadata": {
+                            k: v for k, v in chunk.metadata.items() if k != CHUNK_UUID_KEY
+                        },
                     }
                 )
 
@@ -459,14 +351,14 @@ class DatabasePersistenceStage(PipelineStage):
                 chunks_data=chunks_data,
             )
 
-            logger.info(f"Saved {len(created_chunks)} chunks to database")
+            logger.info("Saved %s chunks to database", len(created_chunks))
 
             # Build the table of contents from chunk headers, replacing any old one
-            toc = self._build_table_of_contents(context.chunks)
+            toc = build_table_of_contents(context.chunks)
             doc_metadata = dict(doc.doc_metadata or {})
             if toc["entries"]:
                 doc_metadata["table_of_contents"] = toc
-                logger.info(f"Saved table of contents with {len(toc['entries'])} entries")
+                logger.info("Saved table of contents with %s entries", len(toc["entries"]))
             else:
                 doc_metadata.pop("table_of_contents", None)
             doc_crud.update_doc_metadata(context.document_id, doc_metadata, merge=False)

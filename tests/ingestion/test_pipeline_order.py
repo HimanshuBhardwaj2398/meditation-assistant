@@ -3,7 +3,7 @@
 import pytest
 
 from core.exceptions import PipelineError
-from core.interfaces import PipelineContext, PipelineStage, StageName
+from core.interfaces import PipelineContext, PipelineStage
 from ingestion.pipeline import PipelineOrchestrator
 
 
@@ -53,23 +53,6 @@ def test_a_cycle_is_rejected():
 def test_a_dependency_missing_from_the_pipeline_is_rejected():
     with pytest.raises(PipelineError, match="not in the pipeline"):
         PipelineOrchestrator([Stage("chunk", "parse")])
-
-
-def test_the_ingestion_stages_order_without_persistence():
-    """With persistence disabled, nothing depends on the missing persistence stage."""
-    from ingestion.chunking import Config as ChunkingConfig
-    from ingestion.stages import ChunkingStage, EmbeddingStage, ParsingStage
-
-    stages = [
-        EmbeddingStage(vector_store_manager=None, vector_only=True),  # type: ignore[arg-type]
-        ChunkingStage(ChunkingConfig()),
-        ParsingStage(parser_factory=None),  # type: ignore[arg-type]
-    ]
-    assert order(PipelineOrchestrator(stages)) == [
-        StageName.PARSING,
-        StageName.CHUNKING,
-        StageName.EMBEDDING,
-    ]
 
 
 async def test_a_stage_whose_dependency_failed_does_not_run():

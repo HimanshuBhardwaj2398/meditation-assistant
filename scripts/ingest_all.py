@@ -105,7 +105,8 @@ def _build_orchestrator(neon_url: str):
 
     collection = get_settings().vector.collection_name
     orchestrator = IngestionOrchestrator(
-        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url)
+        vector_store_config=VectorStoreConfig(collection_name=collection, db_url=neon_url),
+        database=database,
     )
     return orchestrator
 
@@ -129,7 +130,7 @@ async def _run_shard(
                 # Admission maps the source to its document every attempt: a
                 # row left by a failed attempt is resumed (reusing its stored
                 # markdown), never inserted twice.
-                result = await orchestrator.process(source)
+                result = await orchestrator.ingest(source)
 
                 if not result.get("success"):
                     raise RuntimeError(

@@ -1,11 +1,9 @@
 """Tests for chunk metadata restructure."""
 
-import pytest
 from langchain.schema import Document
 
-from ingestion.chunking import Config, MarkdownChunker
-from ingestion.embed import VectorStoreConfig, VectorStoreManager
-from ingestion.stages import DatabasePersistenceStage
+from ingestion.chunking import ChunkingConfig, MarkdownChunker
+from ingestion.toc import build_table_of_contents
 
 
 class TestBuildHeaderPath:
@@ -14,7 +12,7 @@ class TestBuildHeaderPath:
     def setup_method(self):
         self.chunker = MarkdownChunker(
             text="# Test\nSome content",
-            config=Config(enable_semantic=False),
+            config=ChunkingConfig(enable_semantic=False),
         )
 
     def test_single_header(self):
@@ -57,7 +55,7 @@ class TestAddFinalMetadata:
     def setup_method(self):
         self.chunker = MarkdownChunker(
             text="# Test Doc\nSome content",
-            config=Config(enable_semantic=False),
+            config=ChunkingConfig(enable_semantic=False),
             title="Test Doc",
         )
 
@@ -135,11 +133,6 @@ class TestAddFinalMetadata:
 class TestBuildTableOfContents:
     """Tests for TOC builder with new metadata format."""
 
-    def setup_method(self):
-        self.stage = DatabasePersistenceStage(
-            VectorStoreManager(VectorStoreConfig(db_url="postgresql://test/test"))
-        )
-
     def test_single_path_chunks(self):
         chunks = [
             Document(
@@ -157,7 +150,7 @@ class TestBuildTableOfContents:
                 },
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
 
         assert len(toc["entries"]) == 3  # DN, Sutta 1, Sutta 2
         assert toc["entries"][0]["text"] == "DN"
@@ -176,12 +169,12 @@ class TestBuildTableOfContents:
                 },
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
 
         assert len(toc["entries"]) == 3  # DN, Sutta 1, Sutta 2
 
     def test_empty_chunks(self):
-        toc = self.stage._build_table_of_contents([])
+        toc = build_table_of_contents([])
         assert toc["entries"] == []
         assert toc["text"] == ""
 
@@ -192,7 +185,7 @@ class TestBuildTableOfContents:
                 metadata={"all_header_paths": [], "header_level_map": {}},
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
         assert toc["entries"] == []
 
     def test_same_segment_under_different_parents_kept(self):
@@ -212,7 +205,7 @@ class TestBuildTableOfContents:
                 },
             ),
         ]
-        toc = self.stage._build_table_of_contents(chunks)
+        toc = build_table_of_contents(chunks)
         paths = [entry["path_from_root"] for entry in toc["entries"]]
 
         assert "DN 1 > Introduction" in paths
@@ -222,11 +215,10 @@ class TestBuildTableOfContents:
 class TestSplitOversizedChunks:
     """Tests for order stability during semantic split."""
 
-    @pytest.mark.asyncio
-    async def test_preserves_order_when_first_chunk_is_oversized(self):
+    def test_preserves_order_when_first_chunk_is_oversized(self):
         chunker = MarkdownChunker(
             text="# Test\nx",
-            config=Config(
+            config=ChunkingConfig(
                 enable_semantic=False,
                 max_size=20,
                 min_size=1,
@@ -257,7 +249,7 @@ class TestSplitOversizedChunks:
 
         chunker._semantic_split = fake_semantic_split
 
-        result = await chunker._split_oversized_chunks([oversized, normal])
+        result = chunker._split_oversized_chunks([oversized, normal])
         assert [doc.page_content for doc in result] == [
             "split-part-1",
             "split-part-2",

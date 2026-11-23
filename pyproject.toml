@@ -99,7 +99,8 @@ target-version = "py311"
 extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W", "TID251"]
+# G004: log with %-style args, not f-strings (formatting is deferred until emitted).
+select = ["E", "F", "G004", "I", "N", "W", "TID251"]
 ignore = ["E501"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]

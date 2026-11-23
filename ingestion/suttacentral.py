@@ -11,9 +11,10 @@ into the clean header-delimited form the chunker expects. Legacy translations
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 from urllib.parse import urlparse
 
 from markdownify import markdownify as md
@@ -21,6 +22,9 @@ from markdownify import markdownify as md
 from core.exceptions import ParsingError
 from core.interfaces import ParseResult
 from ingestion.markdown_utils import extract_first_h1
+
+if TYPE_CHECKING:
+    import requests
 
 _SC_URL = re.compile(r"^https?://(www\.)?suttacentral\.net/", re.IGNORECASE)
 _SC_SHORTHAND = re.compile(r"^sc:", re.IGNORECASE)
@@ -160,33 +164,28 @@ def nikaya_tags(uid: str) -> dict:
     return result
 
 
-_session = None
-
-
-def _http_session():
+@functools.cache
+def _http_session() -> "requests.Session":
     """One shared HTTP session: reused connections, retries on transient failures.
 
     SuttaCentral's API has had stretches of 502s under load. urllib3 retries
     connection errors and 429/5xx responses up to 3 times with backoff
     (1 s, 2 s, 4 s), honouring Retry-After, before the pipeline sees a failure.
     """
-    global _session
-    if _session is None:
-        import requests
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
-        retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET"}),
-        )
-        session = requests.Session()
-        session.mount("https://", HTTPAdapter(max_retries=retry))
-        session.headers["User-Agent"] = "meditation-db-ingest/0.1"
-        _session = session
-    return _session
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.headers["User-Agent"] = "meditation-db-ingest/0.1"
+    return session
 
 
 def _default_fetch_json(url: str) -> dict:

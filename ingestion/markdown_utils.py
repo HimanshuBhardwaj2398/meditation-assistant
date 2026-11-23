@@ -5,6 +5,9 @@ from typing import Optional
 
 _H1_PATTERN = re.compile(r"^#\s+(.+)$")
 
+# The title of a document that was given none and has no H1 to take one from.
+UNTITLED = "Untitled"
+
 
 def extract_first_h1(markdown: str, max_lines: int = 20) -> Optional[str]:
     """Return the text of the first level-1 heading within the leading lines.
