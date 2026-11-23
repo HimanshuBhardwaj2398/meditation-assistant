@@ -245,9 +245,8 @@ class EmbeddingStage(_BlockingStage):
     Output: Chunks with UUIDs and vectors ready for persistence
     """
 
-    def __init__(self, vector_store_manager: VectorStoreManager, *, vector_only: bool = False):
+    def __init__(self, vector_store_manager: VectorStoreManager):
         self.vector_store_manager = vector_store_manager
-        self.vector_only = vector_only
 
     @property
     def name(self) -> str:
@@ -303,14 +302,7 @@ class EmbeddingStage(_BlockingStage):
                 )
             )
 
-        if self.vector_only:
-            vector_ids = self.vector_store_manager.embed_documents(enriched_chunks)
-            expected_ids = {chunk.id for chunk in enriched_chunks}
-            if len(vector_ids) != len(enriched_chunks) or set(vector_ids) != expected_ids:
-                raise EmbeddingError("Stored vector IDs do not match the chunk IDs")
-            vectors = []
-        else:
-            vectors = self.vector_store_manager.compute_embeddings(enriched_chunks)
+        vectors = self.vector_store_manager.compute_embeddings(enriched_chunks)
 
         logger.info("Successfully embedded %s chunks", len(enriched_chunks))
         return context.with_update(chunks=enriched_chunks, vectors=vectors).mark_stage_completed(

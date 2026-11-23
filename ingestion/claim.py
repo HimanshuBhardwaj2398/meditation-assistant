@@ -84,7 +84,7 @@ def claim_document(
     clear_markdown: bool,
     lease_seconds: int,
     configured_collection: str,
-    vector_store_manager: Optional[VectorStoreManager],
+    vector_store_manager: VectorStoreManager,
 ) -> Optional[PreparedRun]:
     """Take the document's processing claim and load what the run reuses.
 
@@ -97,7 +97,7 @@ def claim_document(
         lease_seconds: How old another run's claim must be before it lapses
         configured_collection: The collection the orchestrator is set up for
         vector_store_manager: Used to find the collection an older document's
-            vectors are in; None when the run does not persist to the database
+            vectors are in
 
     Returns None, without claiming, when the document is COMPLETED and no
     reprocess was asked for.
@@ -145,10 +145,9 @@ def claim_document(
                 f"{lease_seconds}s)"
             )
 
-        if vector_store_manager is not None:
-            run.vector_collection = _resolve_collection(
-                session, doc, configured_collection, vector_store_manager
-            )
+        run.vector_collection = _resolve_collection(
+            session, doc, configured_collection, vector_store_manager
+        )
         if clear_markdown:
             doc.markdown = None
 

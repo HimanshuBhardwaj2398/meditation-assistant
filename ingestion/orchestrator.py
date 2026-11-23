@@ -64,7 +64,6 @@ class IngestionOrchestrator:
         self,
         vector_store_config: VectorStoreConfig,
         chunking_config: Optional[ChunkingConfig] = None,
-        enable_database_persistence: bool = True,
         *,
         parser_factory: Optional[ParserFactory] = None,
         vector_store_manager: Optional[VectorStoreManager] = None,
@@ -76,7 +75,6 @@ class IngestionOrchestrator:
         Args:
             vector_store_config: Configuration for vector store
             chunking_config: Configuration for chunking (optional)
-            enable_database_persistence: Enable database stage (default True)
             parser_factory: Parser selection to use instead of the default
                 ParserFactory (tests inject a fake)
             vector_store_manager: Vector adapter to use instead of one built
@@ -87,7 +85,6 @@ class IngestionOrchestrator:
         self.database = database or get_database()
         self.vector_store_config = vector_store_config
         self.chunking_config = chunking_config or ChunkingConfig.from_settings()
-        self.enable_database_persistence = enable_database_persistence
         self.lease_seconds = IngestionSettings().lease_seconds
 
         # Initialize components
@@ -245,9 +242,7 @@ class IngestionOrchestrator:
             clear_markdown=clear_markdown,
             lease_seconds=self.lease_seconds,
             configured_collection=self.vector_store_config.collection_name,
-            vector_store_manager=(
-                self.vector_store_manager if self.enable_database_persistence else None
-            ),
+            vector_store_manager=self.vector_store_manager,
         )
         if run is None:
             return await asyncio.to_thread(self._existing_result, document_id)
@@ -255,8 +250,6 @@ class IngestionOrchestrator:
 
     def _check_same_database(self) -> None:
         """Vectors and documents must be written to the same database."""
-        if not self.enable_database_persistence:
-            return
         # Compares URLs only; no connection is opened.
         with self.database.session_scope() as session:
             self.vector_store_manager.validate_database(session)
@@ -286,23 +279,12 @@ class IngestionOrchestrator:
     # ------------------------------------------------------------------
 
     def _build_stages(self) -> List[PipelineStage]:
-        stages: List[PipelineStage] = [
+        return [
             ParsingStage(self.parser_factory, self.database),
             ChunkingStage(self.chunking_config),
-            EmbeddingStage(
-                self.vector_store_manager, vector_only=not self.enable_database_persistence
-            ),
+            EmbeddingStage(self.vector_store_manager),
+            DatabasePersistenceStage(self.vector_store_manager, self.database),
         ]
-        if self.enable_database_persistence:
-            stages.append(DatabasePersistenceStage(self.vector_store_manager, self.database))
-        return stages
-
-    @property
-    def _final_stage(self) -> StageName:
-        """The stage whose completion means the document is done."""
-        if self.enable_database_persistence:
-            return StageName.DATABASE_PERSISTENCE
-        return StageName.EMBEDDING
 
     async def _run_pipeline(
         self,
@@ -342,7 +324,10 @@ class IngestionOrchestrator:
             logger.info(f"Starting pipeline for document {run.document_id}")
             final_context = await pipeline.execute(context, on_stage_update=_on_stage_update)
 
-            success = final_context.stage_results.get(self._final_stage) == StageStatus.COMPLETED
+            success = (
+                final_context.stage_results.get(StageName.DATABASE_PERSISTENCE)
+                == StageStatus.COMPLETED
+            )
             result = IngestionResult(
                 document_id=run.document_id,
                 source=run.source,

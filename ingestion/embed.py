@@ -7,8 +7,7 @@ and managing the connection to PostgreSQL with pgvector extension.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-from uuid import uuid4
+from typing import List, Optional
 
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_core.documents import Document
@@ -271,33 +270,3 @@ class VectorStoreManager:
             )
             return None
         return names[0] if names else None
-
-    def embed_documents(self, documents: List[Document]) -> List[str]:
-        """Compute and write vectors for callers without relational chunk persistence."""
-        if not documents:
-            return []
-        vectors = self.compute_embeddings(documents)
-        ids = [doc.id or str(uuid4()) for doc in documents]
-        try:
-            return self.vector_store.add_embeddings(
-                texts=[doc.page_content for doc in documents],
-                embeddings=vectors,
-                metadatas=[doc.metadata for doc in documents],
-                ids=ids,
-            )
-        except Exception as exc:
-            raise EmbeddingError(f"Failed to store embeddings: {exc}") from exc
-
-    def get_collection_info(self) -> Dict[str, Any]:
-        """
-        Get information about the current collection.
-
-        Returns:
-            Dictionary containing collection metadata.
-        """
-        return {
-            "collection_name": self.config.collection_name,
-            "model_name": self.config.model_name,
-            "batch_size": self.config.batch_size,
-            "use_jsonb": self.config.use_jsonb,
-        }

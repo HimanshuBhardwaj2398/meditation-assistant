@@ -157,16 +157,6 @@ class ThreadSafeEmbeddingsCache:
                 logger.error(f"Failed to load embeddings model {model_name}: {e}")
                 raise ChunkingError(f"Failed to load embeddings model: {e}") from e
 
-    def clear_cache(self):
-        """Clear all cached models (for testing or memory management)."""
-        with self._instance_lock:
-            self._cache.clear()
-            logger.info("Cleared embeddings cache")
-
-    def get_cache_info(self) -> Dict[str, Any]:
-        """Get information about cached models."""
-        return {"cached_models": list(self._cache.keys()), "cache_size": len(self._cache)}
-
 
 # ============================================================================
 # MARKDOWN CHUNKER
