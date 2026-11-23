@@ -46,7 +46,7 @@ flowchart LR
 
 | Module | Responsibility | Key entry points |
 |--------|----------------|------------------|
-| [`ingestion/`](../ingestion/) | Source → embedded chunks | [`parsing.py`](../ingestion/parsing.py): `URLParser`, `PDFParser`, `ParserFactory` (strategy pattern + factory) · [`suttacentral.py`](../ingestion/suttacentral.py): `SuttaCentralParser`, `SuttaCentralCatalog` · [`chunking.py`](../ingestion/chunking.py): `MarkdownChunker` · [`markdown_utils.py`](../ingestion/markdown_utils.py): shared markdown helpers · [`embed.py`](../ingestion/embed.py): `VectorStoreManager` · [`stages.py`](../ingestion/stages.py): the four pipeline stages · [`orchestrator.py`](../ingestion/orchestrator.py): `PipelineOrchestrator`, `IngestionOrchestrator` |
+| [`ingestion/`](../ingestion/) | Source → embedded chunks | [`parsing.py`](../ingestion/parsing.py): `URLParser`, `PDFParser`, `ParserFactory` (strategy pattern + factory) · [`suttacentral.py`](../ingestion/suttacentral.py): `SuttaCentralParser`, `SuttaCentralCatalog` · [`chunking.py`](../ingestion/chunking.py): `MarkdownChunker` · [`markdown_utils.py`](../ingestion/markdown_utils.py): shared markdown helpers · [`embed.py`](../ingestion/embed.py): `VectorStoreManager` · [`stages.py`](../ingestion/stages.py): the four pipeline stages · [`pipeline.py`](../ingestion/pipeline.py): `PipelineOrchestrator` · [`claim.py`](../ingestion/claim.py): `claim_document`, `ReprocessMode` · [`orchestrator.py`](../ingestion/orchestrator.py): `IngestionOrchestrator` |
 | [`retrieval/`](../retrieval/) | Search + grounded answering | [`query.py`](../retrieval/query.py): `RetrievalEngine`, `SearchResult` · [`answering.py`](../retrieval/answering.py): `GroundedAnswerService` · [`llm_client.py`](../retrieval/llm_client.py): `LLMClient` · [`utils.py`](../retrieval/utils.py): `extract_header_paths` · three eval notebooks ([dataset generation](../retrieval/eval_dataset_generation.ipynb), [retrieval eval](../retrieval/rag_retrieval_eval.ipynb), [metrics](../retrieval/retrieval_eval_metrics.ipynb)) |
 | [`db/`](../db/) | Persistence | [`schema.py`](../db/schema.py): `Document`, `Chunk`, `DocumentStatus` · [`database.py`](../db/database.py): injectable `Database`, `session_scope` · [`crud.py`](../db/crud.py): `DocumentCRUD`, `ChunkCRUD` |
 | [`services/`](../services/) | Business logic decoupled from the UI | [`ingestion_service.py`](../services/ingestion_service.py): `ingest_document`, `process_document_by_id` · [`collection_service.py`](../services/collection_service.py): `CollectionService` (atomic cross-store deletes/reprocessing) |
@@ -82,9 +82,11 @@ dependencies, defined in [`ingestion/stages.py`](../ingestion/stages.py):
    temporary chunk staging column. A write failure rolls back both sets of rows.
    The application and vector store must use the same database URL.
 
-**Orchestration.** [`PipelineOrchestrator`](../ingestion/orchestrator.py)
-validates at construction that the stage graph has no cycles (DFS with a
-recursion stack), then computes execution order with a topological sort. At
+**Orchestration.** [`PipelineOrchestrator`](../ingestion/pipeline.py)
+orders the stages at construction with the standard library's
+`graphlib.TopologicalSorter`, rejecting a cycle or a dependency on a stage
+that is not in the pipeline. Stage names come from the `StageName` enum in
+[`core/interfaces.py`](../core/interfaces.py). At
 run time it skips stages already `COMPLETED` in the context, refuses stages
 whose dependencies didn't complete, and keeps going after a failure so
 independent work still runs. Stages raise when they cannot finish; the
@@ -112,7 +114,8 @@ catch vectors older runs left without chunk rows) and writes the new ones. If
 the reprocess fails, the old version stays published and the document returns
 to `COMPLETED`.
 
-**One run per document.** A run claims a document by setting
+**One run per document.** A run claims a document
+([`claim_document`](../ingestion/claim.py)) by setting
 `documents.processing_token`, which succeeds only while no run holds a live
 claim. Every status write is fenced by the token and refreshes `updated_at`, so
 a claim lapses only after its run stops writing for `INGESTION_LEASE_SECONDS`

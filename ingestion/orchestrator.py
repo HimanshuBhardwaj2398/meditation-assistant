@@ -7,24 +7,13 @@ and records progress in ``documents.status``.
 """
 
 import logging
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, TypedDict, Union
 
-# LangChain Document for type hints
-from langchain_core.documents import Document as LangchainDocument
-
-from core.exceptions import (
-    DocumentBusyError,
-    DocumentNotFoundError,
-    PipelineError,
-    ProcessingLeaseLostError,
-)
+from core.exceptions import DocumentNotFoundError, PipelineError, ProcessingLeaseLostError
 from core.interfaces import PipelineContext, PipelineStage, StageName, StageStatus
 from ingestion.admission import VECTOR_COLLECTION_KEY, Admission, AdmissionOutcome, admit
 from ingestion.chunking import Config as ChunkingConfig
+from ingestion.claim import PreparedRun, ReprocessMode, claim_document
 from ingestion.embed import VectorStoreConfig, VectorStoreManager
 from ingestion.parsing import ParserFactory
 from ingestion.pipeline import PipelineOrchestrator
@@ -33,29 +22,12 @@ from ingestion.stages import (
     DatabasePersistenceStage,
     EmbeddingStage,
     ParsingStage,
-    source_provenance,
 )
-from ingestion.status import RUNNING_STATUS, StatusRecorder
+from ingestion.status import StatusRecorder
+
+__all__ = ["IngestionOrchestrator", "IngestionResult", "ReprocessMode"]
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# REPROCESS MODES
-# ============================================================================
-
-
-class ReprocessMode(str, Enum):
-    """Supported reprocessing entry points for existing documents."""
-
-    FULL = "full"
-    FROM_CHUNKING = "from_chunking"
-    FROM_EMBEDDING = "from_embedding"
-
-
-# ============================================================================
-# HIGH-LEVEL INGESTION ORCHESTRATOR
-# ============================================================================
 
 
 class IngestionResult(TypedDict):
@@ -71,26 +43,6 @@ class IngestionResult(TypedDict):
     success: bool
     # True when the document was already COMPLETED and nothing was run.
     already_completed: bool
-
-
-@dataclass
-class _PreparedRun:
-    """Everything the pipeline needs to start on one claimed document."""
-
-    document_id: int
-    source: Optional[str]
-    title: Optional[str]
-    token: str
-    # The document was COMPLETED when the run started: a reprocess replaces it.
-    replacing: bool = False
-    parsed_content: Optional[str] = None
-    chunks: List[LangchainDocument] = field(default_factory=list)
-    stage_results: Dict[str, StageStatus] = field(default_factory=dict)
-    source_metadata: Dict[str, Any] = field(default_factory=dict)
-    # The document's own vector collection; publishing writes there.
-    vector_collection: Optional[str] = None
-    # The status the claim set as the run started.
-    start_status: Optional[Any] = None
 
 
 class IngestionOrchestrator:
@@ -218,7 +170,17 @@ class IngestionOrchestrator:
                 return self._existing_result(admission.document_id)
             document_id = admission.document_id
 
-        run = self._claim(document_id, title, mode, clear_markdown)
+        run = claim_document(
+            document_id,
+            title=title,
+            mode=mode,
+            clear_markdown=clear_markdown,
+            lease_seconds=self.lease_seconds,
+            configured_collection=self.vector_store_config.collection_name,
+            vector_store_manager=(
+                self.vector_store_manager if self.enable_database_persistence else None
+            ),
+        )
         if run is None:
             return self._existing_result(document_id)
         return await self._run_pipeline(run, mode, on_stage_update)
@@ -244,7 +206,7 @@ class IngestionOrchestrator:
         return admit(source, title=title, description=description, tags=tags, doc_metadata=metadata)
 
     # ------------------------------------------------------------------
-    # Preparing a document
+    # Before the pipeline
     # ------------------------------------------------------------------
 
     def _check_same_database(self) -> None:
@@ -256,147 +218,6 @@ class IngestionOrchestrator:
         # Compares URLs only; no connection is opened.
         with session_scope() as session:
             self.vector_store_manager.validate_database(session)
-
-    def _claim(
-        self,
-        document_id: int,
-        title: Optional[str],
-        mode: Optional[ReprocessMode],
-        clear_markdown: bool,
-    ) -> Optional[_PreparedRun]:
-        """Take the document's processing claim and load what the run reuses.
-
-        Returns None, without claiming, when the document is COMPLETED and no
-        reprocess was asked for.
-
-        Raises:
-            DocumentNotFoundError: No such document.
-            DocumentBusyError: Another run holds a live claim on it.
-        """
-        from db.crud import ChunkCRUD, DocumentCRUD
-        from db.database import session_scope
-        from db.schema import DocumentStatus
-
-        token = uuid.uuid4().hex
-        stale_before = datetime.now(timezone.utc) - timedelta(seconds=self.lease_seconds)
-
-        with session_scope() as session:
-            crud = DocumentCRUD(session)
-            doc = crud.get_document_by_id(document_id)
-            if not doc:
-                raise DocumentNotFoundError(f"Document {document_id} not found")
-
-            was_completed = doc.status == DocumentStatus.COMPLETED
-            if was_completed and mode is None:
-                return None
-
-            run = _PreparedRun(
-                document_id=doc.id,
-                source=doc.file_path,
-                title=title,
-                token=token,
-                replacing=was_completed,
-            )
-            self._seed(run, doc, ChunkCRUD(session), mode)
-
-            # The claim also sets the status of the first stage that will run,
-            # saving that stage a status write of its own.
-            first_stage = next(name for name in RUNNING_STATUS if name not in run.stage_results)
-            run.start_status = RUNNING_STATUS[first_stage]
-            if not crud.claim_for_processing(
-                document_id,
-                token,
-                stale_before,
-                status=run.start_status,
-                status_details=f"Stage '{first_stage}' running",
-            ):
-                raise DocumentBusyError(
-                    f"Document {document_id} is being processed by another run; "
-                    f"try again once it finishes (a dead run's claim lapses after "
-                    f"{self.lease_seconds}s)"
-                )
-
-            if self.enable_database_persistence:
-                run.vector_collection = self._resolve_collection(session, doc)
-            if clear_markdown:
-                doc.markdown = None
-
-        logger.info("Document %s claimed for %s", document_id, mode.value if mode else "processing")
-        return run
-
-    def _resolve_collection(self, session: Any, doc: Any) -> str:
-        """The document's own vector collection, recorded on it if it lacked one.
-
-        Retries and reprocesses publish into the document's collection,
-        whatever collection this orchestrator is configured for. A document
-        ingested before collections were recorded inherits the collection its
-        vectors are already in, or else gets the configured one.
-        """
-        metadata = dict(doc.doc_metadata or {})
-        collection = metadata.get(VECTOR_COLLECTION_KEY)
-        if collection:
-            if collection != self.vector_store_config.collection_name:
-                logger.info(
-                    "Document %s stays in its own collection %r (not %r)",
-                    doc.id,
-                    collection,
-                    self.vector_store_config.collection_name,
-                )
-            return collection
-
-        collection = (
-            self.vector_store_manager.collection_of_document(session, doc.id)
-            or self.vector_store_config.collection_name
-        )
-        metadata[VECTOR_COLLECTION_KEY] = collection
-        doc.doc_metadata = metadata
-        return collection
-
-    @staticmethod
-    def _seed(
-        run: _PreparedRun,
-        doc: Any,
-        chunk_crud: Any,
-        mode: Optional[ReprocessMode],
-    ) -> None:
-        """Mark the stages a run can reuse as done, from what the document stores."""
-        reuses_stored = mode in (ReprocessMode.FROM_CHUNKING, ReprocessMode.FROM_EMBEDDING)
-        resumes_from_markdown = mode is None and bool(doc.markdown)
-
-        if reuses_stored or resumes_from_markdown:
-            run.title = run.title or doc.title
-            run.source_metadata = source_provenance(doc.doc_metadata or {})
-        elif doc.title != "Untitled":
-            run.title = run.title or doc.title
-
-        if mode == ReprocessMode.FROM_CHUNKING or resumes_from_markdown:
-            if not doc.markdown:
-                raise PipelineError(
-                    f"Document {doc.id} has no stored markdown; cannot start from chunking"
-                )
-            run.parsed_content = doc.markdown
-            run.stage_results = {StageName.PARSING: StageStatus.COMPLETED}
-        elif mode == ReprocessMode.FROM_EMBEDDING:
-            existing_chunks = chunk_crud.get_chunks_by_document(doc.id)
-            if not existing_chunks:
-                raise PipelineError(
-                    f"Document {doc.id} has no stored chunks; cannot start from embedding"
-                )
-            run.stage_results = {
-                StageName.PARSING: StageStatus.COMPLETED,
-                StageName.CHUNKING: StageStatus.COMPLETED,
-            }
-            for chunk_row in existing_chunks:
-                metadata = dict(chunk_row.chunk_metadata or {})
-                metadata["uuid"] = chunk_row.uuid
-                run.chunks.append(
-                    LangchainDocument(page_content=chunk_row.chunk_text, metadata=metadata)
-                )
-
-        if mode == ReprocessMode.FULL and not run.source:
-            raise PipelineError(
-                f"Document {doc.id} is missing file_path; cannot reprocess from parsing"
-            )
 
     def _existing_result(self, document_id: int) -> IngestionResult:
         """Report a COMPLETED document without running anything."""
@@ -446,7 +267,7 @@ class IngestionOrchestrator:
 
     async def _run_pipeline(
         self,
-        run: _PreparedRun,
+        run: PreparedRun,
         mode: Optional[ReprocessMode],
         on_stage_update: Optional[Callable[[str, StageStatus], None]],
     ) -> IngestionResult:
