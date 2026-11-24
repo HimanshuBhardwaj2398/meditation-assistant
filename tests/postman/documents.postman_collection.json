@@ -1,0 +1,322 @@
+{
+  "info": {
+    "name": "Corpus Workbench: Documents API",
+    "description": "Step 1 smoke tests for a running local API with ingested MN documents. The default documentId is 14 (MN 10 in the workbench corpus). For a different database, set documentId to a document with chunks.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:8000"
+    },
+    {
+      "key": "documentId",
+      "value": "14"
+    }
+  ],
+  "item": [
+    {
+      "name": "List MN documents (page 1)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents?nikaya=mn&limit=20&offset=0",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents"
+          ],
+          "query": [
+            {
+              "key": "nikaya",
+              "value": "mn"
+            },
+            {
+              "key": "limit",
+              "value": "20"
+            },
+            {
+              "key": "offset",
+              "value": "0"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Returns the first page of MN documents', () => {",
+              "    const page = pm.response.json();",
+              "    pm.expect(page.offset).to.equal(0);",
+              "    pm.expect(page.limit).to.equal(20);",
+              "    pm.expect(page.total).to.be.a('number').and.be.above(0);",
+              "    pm.expect(page.items).to.have.lengthOf(Math.min(page.limit, page.total));",
+              "    pm.expect(page.items.every(doc => doc.nikaya === 'mn')).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List MN documents (page 3)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents?nikaya=mn&limit=20&offset=40",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents"
+          ],
+          "query": [
+            {
+              "key": "nikaya",
+              "value": "mn"
+            },
+            {
+              "key": "limit",
+              "value": "20"
+            },
+            {
+              "key": "offset",
+              "value": "40"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Skips 40 matches and returns the requested page', () => {",
+              "    const page = pm.response.json();",
+              "    pm.expect(page.offset).to.equal(40);",
+              "    pm.expect(page.limit).to.equal(20);",
+              "    const remaining = Math.max(0, page.total - page.offset);",
+              "    pm.expect(page.items).to.have.lengthOf(Math.min(page.limit, remaining));",
+              "    pm.expect(page.items.every(doc => doc.nikaya === 'mn')).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "List MN documents past the end",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents?nikaya=mn&offset=2147483647",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents"
+          ],
+          "query": [
+            {
+              "key": "nikaya",
+              "value": "mn"
+            },
+            {
+              "key": "offset",
+              "value": "2147483647"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Returns an empty page with a matching total', () => {",
+              "    const page = pm.response.json();",
+              "    pm.expect(page.items).to.deep.equal([]);",
+              "    pm.expect(page.total).to.be.a('number').and.be.above(0);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get a document",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents/{{documentId}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents",
+            "{{documentId}}"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Returns the requested document summary', () => {",
+              "    const document = pm.response.json();",
+              "    pm.expect(document.id).to.equal(Number(pm.variables.get('documentId')));",
+              "    pm.expect(document.title).to.be.a('string').and.not.be.empty;",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get chunks in reading order",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents/{{documentId}}/chunks",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents",
+            "{{documentId}}",
+            "chunks"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+              "pm.test('Returns chunks in ascending index order', () => {",
+              "    const body = pm.response.json();",
+              "    pm.expect(body.document_id).to.equal(Number(pm.variables.get('documentId')));",
+              "    pm.expect(body.items).to.be.an('array').and.not.be.empty;",
+              "    const indices = body.items.map(chunk => chunk.chunk_index);",
+              "    pm.expect(indices).to.deep.equal([...indices].sort((a, b) => a - b));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get an unknown document",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents/0",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents",
+            "0"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 404', () => pm.response.to.have.status(404));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get chunks for an unknown document",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents/0/chunks",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents",
+            "0",
+            "chunks"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 404', () => pm.response.to.have.status(404));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Reject an invalid page size",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/v1/documents?limit=0",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "documents"
+          ],
+          "query": [
+            {
+              "key": "limit",
+              "value": "0"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP 422', () => pm.response.to.have.status(422));",
+              "pm.test('Identifies the invalid limit', () => {",
+              "    const errors = pm.response.json().detail;",
+              "    pm.expect(errors.some(error => error.loc.join('.') === 'query.limit')).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

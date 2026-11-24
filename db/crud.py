@@ -6,7 +6,7 @@ transaction, so multi-step operations stay atomic.
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, or_, text
 from sqlalchemy.dialects import postgresql, sqlite
@@ -93,6 +93,37 @@ class DocumentCRUD:
             List of all documents
         """
         return self.db.query(schema.Document).all()
+
+    def list_documents(
+        self,
+        nikaya: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> Tuple[List[schema.Document], int]:
+        """
+        One page of documents, plus how many match in total.
+
+        Args:
+            nikaya: Collection code ("mn", ...) to filter on, or None for all
+            limit: Page size
+            offset: How many matching documents to skip
+
+        Returns:
+            (the documents on this page, the number of documents that match)
+        """
+        query = self.db.query(schema.Document)
+        if nikaya is not None:
+            # ->> on Postgres, json_extract on SQLite (tests).
+            query = query.filter(schema.Document.doc_metadata["nikaya"].as_string() == nikaya)
+        total = query.count()
+        # A unique tie-breaker keeps page boundaries consistent when timestamps match.
+        rows = (
+            query.order_by(schema.Document.created_at.desc(), schema.Document.id.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        return rows, total
 
     def update_status(
         self,
