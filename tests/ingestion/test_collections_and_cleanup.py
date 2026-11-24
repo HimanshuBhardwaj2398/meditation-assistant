@@ -277,6 +277,10 @@ async def test_postgres_consistency_report_and_orphan_repair(postgres_database, 
 
 @pytest.mark.integration
 async def test_postgres_delete_removes_every_vector_of_the_document(postgres_database, monkeypatch):
+    # The service builds a PGVector store to delete through, and its Voyage
+    # client insists on a key even though deleting embeds nothing. A
+    # placeholder keeps the test from depending on a real key in .env.
+    monkeypatch.setenv("VOYAGE_API_KEY", "placeholder-never-called")
     db = postgres_database
     orchestrator = postgres_orchestrator(db, "alpha", monkeypatch)
     first = await orchestrator.ingest(SOURCE)
