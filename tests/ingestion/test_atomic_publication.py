@@ -60,7 +60,7 @@ async def test_interrupted_ingestion_can_retry_without_orphan_vectors(
         def __init__(self, **kwargs):
             pass
 
-        async def chunk(self):
+        def chunk(self):
             chunks = [Document(page_content="First chunk"), Document(page_content="Second chunk")]
             stats = SimpleNamespace(total_chunks=2, processing_time=0.0, avg_chunk_size=2)
             return chunks, stats
@@ -124,7 +124,7 @@ class TwoChunks:
     def __init__(self, **kwargs):
         pass
 
-    async def chunk(self):
+    def chunk(self):
         chunks = [Document(page_content="First chunk"), Document(page_content="Second chunk")]
         return chunks, SimpleNamespace(total_chunks=2, processing_time=0.0, avg_chunk_size=2)
 
