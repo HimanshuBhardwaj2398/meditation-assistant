@@ -5,6 +5,7 @@ The paging tests check the current page, the matching total, and the paging para
 
 import logging
 
+from db.schema import Document
 from tests.api.conftest import DN_COUNT, MN_COUNT
 
 
@@ -67,6 +68,52 @@ def test_one_document(client, corpus):
     assert response.status_code == 200
     assert response.json()["uid"] == "mn10"
     assert response.json()["nikaya"] == "mn"
+
+
+def test_document_detail_exposes_reader_metadata_without_internal_fields(client, corpus, database):
+    document_id = corpus["mn10_id"]
+    with database.session_scope() as session:
+        doc = session.get(Document, document_id)
+        doc.description = "A discourse on the foundations of mindfulness."
+        doc.tags = ["meditation"]
+        doc.markdown = "This is fetched through the chunks endpoint."
+        doc.status_details = "An internal status message."
+        doc.doc_metadata = {
+            **doc.doc_metadata,
+            "type": "ancient_text",
+            "author_uid": "sujato",
+            "reading_url": "https://suttacentral.net/mn10/en/sujato",
+            "internal_marker": "unused",
+        }
+
+    response = client.get(f"/v1/documents/{document_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["description"] == "A discourse on the foundations of mindfulness."
+    assert body["tags"] == ["meditation"]
+    assert body["doc_type"] == "ancient_text"
+    assert body["author_uid"] == "sujato"
+    assert body["reading_url"] == "https://suttacentral.net/mn10/en/sujato"
+    assert {
+        "file_path",
+        "markdown",
+        "status_details",
+        "doc_metadata",
+        "internal_marker",
+    }.isdisjoint(body)
+
+
+def test_a_document_with_an_invalid_stored_reading_url_can_still_be_read(client, corpus, database):
+    document_id = corpus["mn10_id"]
+    with database.session_scope() as session:
+        doc = session.get(Document, document_id)
+        doc.doc_metadata = {**doc.doc_metadata, "reading_url": "not a web URL"}
+
+    response = client.get(f"/v1/documents/{document_id}")
+
+    assert response.status_code == 200
+    assert response.json()["reading_url"] is None
 
 
 def test_chunks_come_back_in_reading_order(client, corpus):

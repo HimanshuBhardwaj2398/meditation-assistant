@@ -10,7 +10,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query
 
 from api.deps import SessionDep
-from api.schemas import ChunkList, ChunkOut, DocumentPage, DocumentSummary
+from api.schemas import ChunkList, ChunkOut, DocumentDetail, DocumentPage, DocumentSummary
 from db.crud import ChunkCRUD, DocumentCRUD
 
 router = APIRouter(prefix="/v1/documents", tags=["documents"])
@@ -28,12 +28,12 @@ def list_documents(
     return DocumentPage(items=items, total=total, limit=limit, offset=offset)
 
 
-@router.get("/{document_id}", response_model=DocumentSummary)
-def get_document(document_id: int, session: SessionDep) -> DocumentSummary:
+@router.get("/{document_id}", response_model=DocumentDetail)
+def get_document(document_id: int, session: SessionDep) -> DocumentDetail:
     doc = DocumentCRUD(session).get_document_by_id(document_id)
     if doc is None:
         raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
-    return DocumentSummary.from_row(doc)
+    return DocumentDetail.from_row(doc)
 
 
 @router.get("/{document_id}/chunks", response_model=ChunkList)

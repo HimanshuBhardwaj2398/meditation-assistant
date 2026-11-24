@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Browse the corpus and read document chunks in order.">
+    <title>Corpus Workbench</title>
+    <link rel="stylesheet" href="./style.css">
+    <script type="module" src="./reader.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="container masthead">
+        <h1>Corpus Workbench</h1>
+        <a class="docs-link" href="/docs">API docs</a>
+      </div>
+    </header>
+    <main class="container workspace">
+      <section class="catalog" aria-labelledby="catalog-title">
+        <h2 id="catalog-title">Documents</h2>
+        <label for="nikaya">Nikāya</label>
+        <select id="nikaya" name="nikaya">
+          <option value="">All documents</option>
+          <option value="dn">DN (Dīgha Nikāya)</option>
+          <option value="mn">MN (Majjhima Nikāya)</option>
+          <option value="sn">SN (Saṃyutta Nikāya)</option>
+          <option value="an">AN (Aṅguttara Nikāya)</option>
+          <option value="kn">KN (Khuddaka Nikāya)</option>
+        </select>
+        <p class="line-note" id="catalog-status" role="status"></p>
+        <button class="control" id="retry-list" type="button" hidden>Retry list</button>
+        <div class="list-skeleton" id="list-skeleton" aria-hidden="true" hidden>
+          <i></i><i></i><i></i>
+        </div>
+        <nav class="pagination" aria-label="Document pages">
+          <button class="control" id="previous" type="button" disabled>Previous</button>
+          <span class="page-number" id="page-number"></span>
+          <button class="control" id="next" type="button" disabled>Next</button>
+        </nav>
+        <ul class="document-list" id="document-list" aria-label="Documents on this page"></ul>
+      </section>
+      <article class="reader" aria-labelledby="reader-title">
+        <a class="back-link" href="#catalog-title">Back to documents</a>
+        <header class="reader-heading">
+          <p id="reader-code" class="reader-code" hidden></p>
+          <h2 id="reader-title" tabindex="-1">Reader</h2>
+        </header>
+        <details class="document-details" id="document-details" hidden>
+          <summary>Document metadata</summary>
+          <p class="line-note" id="details-status" role="status" hidden></p>
+          <div id="details-content"></div>
+          <button class="control" id="retry-details" type="button" hidden>Retry metadata</button>
+        </details>
+        <div class="reader-toolbar">
+          <p class="line-note" id="reader-status" role="status">Choose a document to read.</p>
+          <div class="chunk-controls">
+            <div class="chunk-jump" id="chunk-jump" hidden>
+              <label for="chunk-select">Jump to</label>
+              <select id="chunk-select" name="chunk" aria-label="Jump to chunk">
+                <option value="">Choose a chunk</option>
+              </select>
+            </div>
+            <button class="control" id="refresh-chunks" type="button" hidden>Refresh chunks</button>
+          </div>
+        </div>
+        <div class="reader-skeleton" id="reader-skeleton" aria-hidden="true" hidden>
+          <i></i><i></i><i></i>
+        </div>
+        <div id="chunks"></div>
+      </article>
+      <noscript>Enable JavaScript to browse documents and read their chunks.</noscript>
+    </main>
+  </body>
+</html>
