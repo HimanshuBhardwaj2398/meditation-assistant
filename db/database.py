@@ -19,6 +19,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import DatabaseSettings, get_settings
@@ -92,7 +93,8 @@ class Database:
             yield session
             session.commit()
         except Exception as exc:
-            logger.error("Session error: %s", exc)
+            if isinstance(exc, SQLAlchemyError):
+                logger.error("Session error: %s", exc)
             session.rollback()
             raise
         finally:
