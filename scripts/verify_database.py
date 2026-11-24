@@ -23,7 +23,7 @@ from sqlalchemy.exc import OperationalError
 
 from config.settings import get_settings
 from db.crud import DocumentCRUD
-from db.database import engine, session_scope
+from db.database import get_database, session_scope
 from db.schema import DocumentStatus
 from db.vector_consistency import check_vector_consistency, delete_orphan_vectors
 
@@ -32,7 +32,7 @@ def verify_connection():
     """Test database connection."""
     print("1. Testing database connection...")
     try:
-        with engine.connect() as conn:
+        with get_database().engine.connect() as conn:
             result = conn.execute(text("SELECT version()"))
             version = result.fetchone()[0]
             print(f"   ✓ Connected to PostgreSQL: {version[:50]}...")
@@ -46,7 +46,7 @@ def verify_pgvector():
     """Check pgvector extension."""
     print("\n2. Checking pgvector extension...")
     try:
-        with engine.connect() as conn:
+        with get_database().engine.connect() as conn:
             result = conn.execute(text("SELECT * FROM pg_extension WHERE extname = 'vector'"))
             if result.fetchone():
                 print("   ✓ pgvector extension is installed")
@@ -62,7 +62,7 @@ def verify_pgvector():
 def verify_tables():
     """Check that all required tables exist."""
     print("\n3. Verifying database tables...")
-    inspector = inspect(engine)
+    inspector = inspect(get_database().engine)
     tables = inspector.get_table_names()
 
     required_tables = ["documents", "chunks"]
@@ -81,7 +81,7 @@ def verify_tables():
 def verify_document_schema():
     """Check Document table has all required columns."""
     print("\n4. Verifying Document table schema...")
-    inspector = inspect(engine)
+    inspector = inspect(get_database().engine)
     columns = {col["name"] for col in inspector.get_columns("documents")}
 
     required_columns = {
@@ -111,7 +111,7 @@ def verify_document_schema():
 def verify_chunk_schema():
     """Check Chunk table has all required columns."""
     print("\n5. Verifying Chunk table schema...")
-    inspector = inspect(engine)
+    inspector = inspect(get_database().engine)
     columns = {col["name"] for col in inspector.get_columns("chunks")}
 
     required_columns = {

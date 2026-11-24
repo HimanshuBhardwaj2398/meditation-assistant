@@ -1,11 +1,10 @@
 from .crud import DocumentCRUD
-from .database import get_db, session_scope
+from .database import session_scope
 from .schema import Document, DocumentStatus
 
 __all__ = [
     "Document",
     "DocumentCRUD",
     "DocumentStatus",
-    "get_db",
     "session_scope",
 ]

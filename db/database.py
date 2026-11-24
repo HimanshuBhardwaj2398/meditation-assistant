@@ -2,11 +2,12 @@
 Database connection and session management.
 
 The engine is owned by a :class:`Database` object constructed on demand rather
-than at import time, so importing this module no longer requires database
-configuration (the seam that makes persistence injectable and testable). A
-lazily-built default ``Database`` (from application settings) backs the
-backward-compatible module-level ``session_scope`` / ``get_db``
-helpers and the ``engine`` / ``SessionLocal`` attributes.
+than at import time, so importing this module requires no database
+configuration (the seam that makes persistence injectable and testable).
+
+Most call sites use the process-wide default database through the module-level
+``session_scope()``; ``get_database()`` returns it and ``set_default_database()``
+lets a composition root (an ingestion CLI, a test) point it elsewhere.
 """
 
 import logging
@@ -19,6 +20,7 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import DatabaseSettings, get_settings
@@ -92,7 +94,8 @@ class Database:
             yield session
             session.commit()
         except Exception as exc:
-            logger.error("Session error: %s", exc)
+            if isinstance(exc, SQLAlchemyError):
+                logger.error("Session error: %s", exc)
             session.rollback()
             raise
         finally:
@@ -125,7 +128,7 @@ def alembic_head() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatible module-level API (delegates to a lazily-built default DB)
+# Process-wide default database (built lazily from application settings)
 # ---------------------------------------------------------------------------
 
 _default_database: Optional[Database] = None
@@ -143,8 +146,8 @@ def set_default_database(database: Database) -> None:
     """Override the process-wide default Database.
 
     Intended for a composition root (e.g. an ingestion CLI targeting a specific
-    database) to redirect the backward-compatible module-level ``session_scope``
-    without threading a Database through every call site.
+    database) to redirect the module-level ``session_scope`` without threading a
+    Database through every call site.
     """
     global _default_database
     _default_database = database
@@ -152,7 +155,7 @@ def set_default_database(database: Database) -> None:
 
 @contextmanager
 def session_scope() -> Iterator[Session]:
-    """Transactional scope backed by the default database (backward-compatible).
+    """Transactional scope backed by the default database.
 
     Usage:
         with session_scope() as session:
@@ -160,21 +163,3 @@ def session_scope() -> Iterator[Session]:
     """
     with get_database().session_scope() as session:
         yield session
-
-
-def get_db() -> Iterator[Session]:
-    """Yield a session from the default database (e.g. for request handlers)."""
-    session = get_database().session_factory()
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-def __getattr__(name: str):
-    """Lazily expose ``engine`` / ``SessionLocal`` without building them at import."""
-    if name == "engine":
-        return get_database().engine
-    if name == "SessionLocal":
-        return get_database().session_factory
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Drop `db.database` compatibility shims (2026-11-24)
+
+#### Removed
+- `db.database.get_db` (and its `db` package re-export) — unused; the API's
+  request sessions come from `api/deps.py::get_session`.
+- The module-level `__getattr__` that lazily exposed `engine` / `SessionLocal`.
+  Use `get_database().engine` / `get_database().session_factory` instead;
+  `scripts/verify_database.py` was the last caller and now does so.
+- The module-level `session_scope`, `get_database` and `set_default_database`
+  stay — they are the default-database API, no longer labelled
+  "backward-compatible".
+
 ### Groq default model swap (2026-08-19)
 
 #### Changed
