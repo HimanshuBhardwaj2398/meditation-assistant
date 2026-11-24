@@ -24,9 +24,6 @@ def list_documents(
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> DocumentPage:
     rows, total = DocumentCRUD(session).list_documents(nikaya=nikaya, limit=limit, offset=offset)
-    # TODO(human): build and return the DocumentPage. Convert each row with
-    # DocumentSummary.from_row(...) here, while the session is still open.
-    rows, total = DocumentCRUD(session).list_documents(nikaya=nikaya, limit=limit, offset=offset)
     items = [DocumentSummary.from_row(row) for row in rows]
     return DocumentPage(items=items, total=total, limit=limit, offset=offset)
 
