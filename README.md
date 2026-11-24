@@ -90,6 +90,15 @@ poetry run alembic upgrade head
 poetry run streamlit run app.py
 ```
 
+**Corpus Workbench** — browse documents and read their chunks in the same app that serves the API:
+
+```bash
+poetry run uvicorn api.main:app --reload
+```
+
+Open [the workbench](http://127.0.0.1:8000/workbench/) or [the API docs](http://127.0.0.1:8000/docs).
+The UI in `console/` uses the same `DB_URL` as the API and needs no frontend build.
+
 **CLI**:
 
 ```bash
